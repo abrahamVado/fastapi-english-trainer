@@ -2,10 +2,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.logging import configure_logging
-from app.api.routers import health, stt, tts, eval as eval_router, sessions
+from app.api.routers import health, stt, tts, sessions
+from app.api.routers import sim, ipa
+from app.lifespan import lifespan
 
 configure_logging(settings.LOG_LEVEL)
-app = FastAPI(title="English Trainer API")
+app = FastAPI(title="English Trainer API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,5 +20,6 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(stt.router, prefix=settings.API_PREFIX)
 app.include_router(tts.router, prefix=settings.API_PREFIX)
-app.include_router(eval_router.router, prefix=settings.API_PREFIX)
 app.include_router(sessions.router, prefix=settings.API_PREFIX)
+app.include_router(sim.router,      prefix=settings.API_PREFIX)
+app.include_router(ipa.router,      prefix=settings.API_PREFIX)

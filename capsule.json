@@ -1,0 +1,74 @@
+{
+  "name": "english-trainer-api",
+  "version": "0.1.0",
+  "updated": "2025-08-30T19:08:37.129848Z",
+  "purpose": "FastAPI service for English training: STT, TTS, sessions, and evaluation scaffold; designed to add IPA/pronunciation scoring.",
+  "api_prefix": "/api",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "desc": "Liveness: returns name, version, ok"
+    },
+    {
+      "method": "POST",
+      "path": "/api/stt",
+      "desc": "Multipart (audio) → text (Whisper stub)"
+    },
+    {
+      "method": "POST",
+      "path": "/api/tts",
+      "desc": "JSON (text, voice) → streaming audio/wav (Piper stub)"
+    },
+    {
+      "method": "POST",
+      "path": "/api/eval",
+      "desc": "reference + hypothesis → placeholder scores"
+    },
+    {
+      "method": "POST",
+      "path": "/api/sessions",
+      "desc": "Create in-memory session"
+    },
+    {
+      "method": "GET",
+      "path": "/api/sessions",
+      "desc": "List in-memory sessions"
+    },
+    {
+      "method": "POST",
+      "path": "/api/sessions/{sid}/end",
+      "desc": "Mark session ended"
+    }
+  ],
+  "settings": {
+    "ENV": "dev",
+    "API_PREFIX": "/api",
+    "CORS_ORIGINS": [
+      "*"
+    ],
+    "LOG_LEVEL": "INFO",
+    "DATABASE_URL": "sqlite:///./english.db",
+    "WHISPER_MODEL": "base",
+    "PIPER_VOICE": "en_US-amy-medium.onnx"
+  },
+  "implementation_notes": {
+    "routers": "Thin HTTP layer under app/api/routers/*",
+    "services": "Feature logic stubs under app/services/*",
+    "schemas": "Pydantic models under app/schemas/*",
+    "lifespan": "Startup/shutdown hook ready (not used yet)",
+    "db": "SQLAlchemy engine + Session factory; Session model unused by router yet"
+  },
+  "tests": [
+    "tests/test_health.py",
+    "tests/test_sessions.py",
+    "tests/test_eval.py"
+  ],
+  "roadmap": [
+    "Replace Whisper/Piper stubs with real backends",
+    "Persist sessions via SQLAlchemy",
+    "Add /ipa/pronounce and /pron/score",
+    "Interview simulator endpoints /sim/*",
+    "Use lifespan to warm models on startup"
+  ]
+}
