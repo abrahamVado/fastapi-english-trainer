@@ -11,5 +11,8 @@ python-dotenv==1.0.*   # env var convenience
 jiwer==3.0.*           # (optional) text alignment/WER for scoring
 faster-whisper==1.0.0
 eng-to-ipa==0.0.2
+torch==2.3.*            
+numpy==1.26.*
+bark==0.1.5             # Suno Bark
 
 
