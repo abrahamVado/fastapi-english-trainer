@@ -4,6 +4,10 @@ import io, re, wave, struct, os
 import numpy as np
 
 from bark import SAMPLE_RATE, generate_audio, preload_models
+import torch
+torch.set_default_device("cuda")        # ensure Bark/Torch ops run on GPU
+torch.backends.cudnn.benchmark = True   # (optional) speed on repeated shapes
+
 
 class BarkService:
     """
