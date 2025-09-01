@@ -1,97 +1,144 @@
 # app/services/tts/bark_service.py
 from __future__ import annotations
-import io, re, wave, struct, os
+import io, re, wave, os, asyncio
 import numpy as np
 
-from bark import SAMPLE_RATE, generate_audio, preload_models
-import torch
-torch.set_default_device("cuda")        # ensure Bark/Torch ops run on GPU
-torch.backends.cudnn.benchmark = True   # (optional) speed on repeated shapes
+# Bark 0.1.5 can expose APIs in slightly different places; make this robust.
+try:
+    from bark import generate_audio, preload_models
+    from bark.generation import SAMPLE_RATE
+except Exception:
+    from bark.api import generate_audio          # type: ignore
+    from bark.generation import SAMPLE_RATE, preload_models  # type: ignore
 
+import torch
+
+# Prefer CUDA if present, but don’t crash if missing
+if torch.cuda.is_available():
+    try:
+        torch.set_default_device("cuda")
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass  # safe fallback
 
 class BarkService:
     """
     Bark TTS wrapper.
     - Generates 24 kHz audio from text using a voice preset (history_prompt).
-    - Returns a single WAV as a byte stream (you can stream chunks if you want later).
+    - By default returns a single WAV as bytes (fits <audio>).
+    - Concurrency is limited via a semaphore to protect GPU VRAM.
     """
 
-    _is_warmed = False
+    _is_warmed_full = False
+    _is_warmed_small = False
+    _sem = asyncio.Semaphore(1)   # Bark is heavy; raise cautiously if VRAM allows.
 
-    def __init__(self,
-                 device: str = "cpu",
-                 voice_preset: str = "v2/en_speaker_6",
-                 text_temp: float = 0.7,
-                 waveform_temp: float = 0.7):
-        # Bark uses torch under the hood and will pick CUDA if available.
-        # We keep 'device' for clarity; Bark API doesn't take it directly.
-        os.environ.setdefault("SUNO_USE_SMALL_MODELS", "false")  # set "true" for lower VRAM
+    def __init__(
+        self,
+        voice_preset: str = "v2/es_speaker_0",
+        text_temp: float = 0.7,
+        waveform_temp: float = 0.7,
+        use_small_default: bool = False,
+    ):
         self.voice_preset = voice_preset
         self.text_temp = float(text_temp)
         self.waveform_temp = float(waveform_temp)
+        self.use_small_default = bool(use_small_default)
 
-    @staticmethod
-    def warm_models():
-        if not BarkService._is_warmed:
-            # downloads / loads coarse, fine, and codec models into cache
-            preload_models()
-            BarkService._is_warmed = True
+        # default to full models unless SMALL explicitly requested
+        os.environ.setdefault("SUNO_USE_SMALL_MODELS", "false")
+
+    @classmethod
+    def warm_models(cls, *, use_small: bool = False):
+        # Avoid reloading while still allowing both modes to be warmed independently.
+        if use_small and not cls._is_warmed_small:
+            preload_models(
+                text_use_small=True, coarse_use_small=True,
+                fine_use_small=True, codec_use_small=True
+            )
+            cls._is_warmed_small = True
+        elif (not use_small) and (not cls._is_warmed_full):
+            preload_models(
+                text_use_small=False, coarse_use_small=False,
+                fine_use_small=False, codec_use_small=False
+            )
+            cls._is_warmed_full = True
 
     @staticmethod
     def _to_wav_bytes(samples: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
-        # Bark returns float32 in [-1, 1]. Convert to 16-bit PCM WAV.
-        samples = np.clip(samples, -1.0, 1.0)
-        int16 = (samples * 32767.0).astype(np.int16)
+        # Bark returns float32 [-1, 1]. Convert to 16-bit PCM WAV.
+        s = np.clip(samples, -1.0, 1.0)
+        pcm = (s * 32767.0).astype(np.int16)
+
         bio = io.BytesIO()
         with wave.open(bio, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)
+            wf.setsampwidth(2)      # 16-bit
             wf.setframerate(sr)
-            wf.writeframes(int16.tobytes())
-        bio.seek(0)
-        return bio.read()
+            wf.writeframes(pcm.tobytes())
+        return bio.getvalue()
 
     @staticmethod
     def _split_into_chunks(text: str) -> list[str]:
-        # Simple sentence splitter to keep Bark snappy on long inputs.
-        # You can replace with a smarter splitter later.
+        # Lightweight sentence-ish splitter to keep latency reasonable.
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return []
-        # split at . ? ! ; or long commas
         parts = re.split(r"(?<=[\.\?\!;])\s+|,\s{1,3}", text)
-        # Merge very short fragments with neighbors
+
         chunks, buf = [], ""
         for p in parts:
-            if len((buf + " " + p).strip()) < 80:
-                buf = (buf + " " + p).strip()
+            nxt = (buf + " " + p).strip() if buf else p
+            if len(nxt) < 100:  # keep chunks under ~100 chars
+                buf = nxt
             else:
                 if buf: chunks.append(buf)
                 buf = p
-        if buf: chunks.append(buf)
+        if buf:
+            chunks.append(buf)
         return chunks
 
-    async def synthesize(self, text: str, voice: str | None = None):
+    async def synthesize_bytes(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        use_small: bool | None = None,
+        seed: int | None = None,
+        text_temp: float | None = None,
+        waveform_temp: float | None = None,
+    ) -> bytes:
         """
-        Async generator yielding a single WAV (you can later chunk-yield per sentence).
+        Generate a single WAV (bytes). Safe to return via Response/StreamingResponse.
         """
-        if not BarkService._is_warmed:
-            BarkService.warm_models()
+        use_small = self.use_small_default if use_small is None else use_small
+        self.warm_models(use_small=use_small)
 
-        preset = (voice or self.voice_preset) or "v2/en_speaker_6"
-        chunks = self._split_into_chunks(text)
+        preset = (voice or self.voice_preset) or "v2/es_speaker_0"
+        tt = self.text_temp if text_temp is None else float(text_temp)
+        wt = self.waveform_temp if waveform_temp is None else float(waveform_temp)
 
-        # Generate per chunk and concatenate
-        audio_all = None
-        for ch in chunks or [""]:
-            audio = generate_audio(
-                ch,
-                history_prompt=preset,
-                text_temp=self.text_temp,
-                waveform_temp=self.waveform_temp,
-            )
-            audio_all = audio if audio_all is None else np.concatenate([audio_all, audio])
+        chunks = self._split_into_chunks(text) or [""]
 
-        wav = self._to_wav_bytes(audio_all if audio_all is not None else np.zeros(1, dtype=np.float32))
-        # Yield once (keeps signature compatible with StreamingResponse)
+        # Serialize heavy GPU work
+        async with self._sem:
+            audio_all = None
+            for ch in chunks:
+                audio = generate_audio(
+                    ch,
+                    history_prompt=preset,
+                    text_temp=tt,
+                    waveform_temp=wt,
+                    seed=seed,
+                )
+                audio_all = audio if audio_all is None else np.concatenate([audio_all, audio])
+
+        return self._to_wav_bytes(audio_all if audio_all is not None else np.zeros(1, dtype=np.float32))
+
+    async def synthesize_stream(self, *args, **kwargs):
+        """
+        Async generator that yields a *single* WAV blob.
+        (Keeping generator signature so you can later emit per-sentence chunks if you switch to MP3/WebM streaming.)
+        """
+        wav = await self.synthesize_bytes(*args, **kwargs)
         yield wav

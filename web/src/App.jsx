@@ -13,18 +13,8 @@ export default function App() {
       title: "Conversation",
       createdAt: Date.now(),
       messages: [
-        {
-          role: "user",
-          type: "text",
-          payload: "What’s a friendly way to start small talk at a meetup?",
-          ts: Date.now() - 60000,
-        },
-        {
-          role: "bot",
-          type: "text",
-          payload: "Try: “What brought you here today?” Then follow with a related experience.",
-          ts: Date.now(),
-        },
+        { role: "user", type: "text", payload: "What’s a friendly way to start small talk at a meetup?", ts: Date.now()-60000 },
+        { role: "bot",  type: "text", payload: "Try: “What brought you here today?” Then follow with a related experience.", ts: Date.now() },
       ],
     },
   ]);
@@ -32,8 +22,8 @@ export default function App() {
   const conversationRef = useRef(null);
 
   const addMessage = useCallback((role, type, payload) => {
-    setChats((prev) =>
-      prev.map((c) =>
+    setChats(prev =>
+      prev.map(c =>
         c.id === currentChatId
           ? { ...c, messages: [...c.messages, { role, type, payload, ts: Date.now() }] }
           : c
@@ -41,12 +31,46 @@ export default function App() {
     );
   }, [currentChatId]);
 
+  // Warm Bark models on mount (non-blocking)
+  useEffect(() => {
+    fetch(API.ttsWarm, { method: "POST" }).catch(() => {});
+  }, []);
+
+  // recorder FIRST (so setIsProcessing exists when onBlob runs)
+  const { isRecording, isProcessing, setIsProcessing, start, stop } =
+    useRecorder({ maxSeconds: 60, onBlob: null });
+
   const scrollToBottom = useCallback(() => {
     const el = conversationRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, []);
   useEffect(scrollToBottom, [chats, scrollToBottom]);
 
+  // speak helper → call Bark and append audio
+  const speak = useCallback(async (text) => {
+    try {
+      const res = await fetch(API.tts, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          voice: "v2/es_speaker_0", // pick your default voice
+          // use_small: true,
+          // seed: 1234,
+        }),
+      });
+      if (res.ok) {
+        const blob = await res.blob();          // audio/wav
+        addMessage("bot", "audio", blob);
+      } else {
+        console.warn("TTS failed", await res.text());
+      }
+    } catch (e) {
+      console.warn("TTS error", e);
+    }
+  }, [addMessage]);
+
+  // now define onBlob using the recorder
   const onBlob = useCallback((blob) => {
     addMessage("user", "audio", blob);
     setStatus({ kind: "warn", text: "Sending… please wait" });
@@ -57,7 +81,10 @@ export default function App() {
         form.append("mode", "conversation");
         const r = await fetch(API.audio, { method: "POST", body: form });
         const data = await r.json().catch(() => ({}));
-        addMessage("bot", "text", data?.answer || "Received response.");
+        const answer = data?.answer || "Received response.";
+
+        addMessage("bot", "text", answer);
+        speak(answer); // 🔊 give the bot a voice
         setStatus({ kind: "", text: "Idle — ready" });
       } catch (e) {
         console.error(e);
@@ -67,23 +94,26 @@ export default function App() {
         setIsProcessing(false);
       }
     })();
-  }, []);
+  }, [addMessage, setIsProcessing, speak]);
 
-  const { isRecording, isProcessing, setIsProcessing, start, stop } =
-    useRecorder({ maxSeconds: 60, onBlob });
+  // wire onBlob into the recorder (since we created the hook earlier)
+  useEffect(() => {
+    // quick way to “rebind” the callback without changing the hook signature:
+    // start/stop unaffected; we just need onBlob to be current.
+    (window).__onBlob = onBlob; // debug convenience
+  }, [onBlob]);
 
+  // update status by recording state
   useEffect(() => {
     if (isRecording) setStatus({ kind: "warn", text: "Recording… click stop to send" });
-    else if (!isProcessing) setStatus((s) => ({ ...s, kind: "", text: "Idle — ready" }));
+    else if (!isProcessing) setStatus(s => ({ ...s, kind: "", text: "Idle — ready" }));
   }, [isRecording, isProcessing]);
 
-  const handleRecordClick = () => {
-    if (isRecording) stop();
-    else start();
-  };
+  const handleRecordClick = () => { isRecording ? stop() : start(onBlob); };
+  // If your useRecorder expects the callback in options only, adjust hook to accept start(cb)
 
   const currentMessages = useMemo(
-    () => chats.find((c) => c.id === currentChatId)?.messages || [],
+    () => chats.find(c => c.id === currentChatId)?.messages || [],
     [chats, currentChatId]
   );
 
@@ -103,16 +133,8 @@ export default function App() {
                 <div className="title" id="modeTitle">Conversation</div>
               </div>
 
-              <div
-                id="conversation"
-                role="log"
-                aria-live="polite"
-                aria-relevant="additions"
-                ref={conversationRef}
-              >
-                {currentMessages.map((m, i) => (
-                  <Bubble m={m} key={i} />
-                ))}
+              <div id="conversation" role="log" aria-live="polite" aria-relevant="additions" ref={conversationRef}>
+                {currentMessages.map((m, i) => <Bubble m={m} key={i} />)}
               </div>
 
               <div id="controls" className="controls">
