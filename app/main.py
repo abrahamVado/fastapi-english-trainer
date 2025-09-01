@@ -107,8 +107,6 @@ app.include_router(sessions.router, prefix=settings.API_PREFIX)
 app.include_router(sim.router,      prefix=settings.API_PREFIX)
 app.include_router(ipa.router,      prefix=settings.API_PREFIX)
 app.include_router(gpu.router,      prefix=settings.API_PREFIX)
-
-
 # ---------------------------------------------------------------------
 # 5. Optional root endpoint (nice for humans)
 # ---------------------------------------------------------------------

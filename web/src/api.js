@@ -1,51 +1,56 @@
 // src/api.js
-// src/api.js
+// Centralized API client for the frontend
+
+// IMPORTANT: set this in web/.env.development:
+//   VITE_API_BASE_URL=https://trainer.local:8000
 const base =
   (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_BASE_URL) ||
-  "https://localhost:8000";
-
+  "https://trainer.local:8000"; // fallback for dev
 
 const u = (p) => `${base}${p}`;
 
-console.log(base);
+// ---------- small helpers ----------
+async function getJSON(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${opts?.method || "GET"} ${url} -> ${r.status}`);
+  return r.json();
+}
+async function getBlob(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${opts?.method || "GET"} ${url} -> ${r.status}`);
+  return r.blob();
+}
+
 // -------------------- API methods --------------------
 
 // Health check
 async function health() {
-  const r = await fetch(u("/health"));
-  if (!r.ok) throw new Error(`health failed: ${r.status}`);
-  return r.json();
+  return getJSON(u("/health"));
 }
 
 // Simulation
 async function simStart(payload) {
-  const r = await fetch(u("/api/sim/start"), {
+  return getJSON(u("/api/sim/start"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(`start failed: ${r.status}`);
-  return r.json();
 }
 
 async function simNext(payload) {
-  const r = await fetch(u("/api/sim/next"), {
+  return getJSON(u("/api/sim/next"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(`next failed: ${r.status}`);
-  return r.json();
 }
 
 async function simAnswerText(payload) {
-  const r = await fetch(u("/api/sim/answer/text"), {
+  return getJSON(u("/api/sim/answer/text"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(`answer text failed: ${r.status}`);
-  return r.json();
 }
 
 async function simAnswerAudio(session_id, question_id, blob) {
@@ -57,29 +62,37 @@ async function simAnswerAudio(session_id, question_id, blob) {
     new File([blob], "answer.webm", { type: blob.type || "audio/webm" })
   );
 
-  const r = await fetch(u("/api/sim/answer/audio"), { method: "POST", body: form });
-  if (!r.ok) throw new Error(`answer audio failed: ${r.status}`);
-  return r.json();
+  return getJSON(u("/api/sim/answer/audio"), { method: "POST", body: form });
 }
 
 async function simScore(payload) {
-  const r = await fetch(u("/api/sim/score"), {
+  return getJSON(u("/api/sim/score"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(`score failed: ${r.status}`);
-  return r.json();
 }
 
 async function simReport(session_id) {
-  const r = await fetch(u(`/api/sim/report?session_id=${encodeURIComponent(session_id)}`));
-  if (!r.ok) throw new Error(`report failed: ${r.status}`);
-  return r.json();
+  return getJSON(u(`/api/sim/report?session_id=${encodeURIComponent(session_id)}`));
+}
+
+// -------------------- TTS --------------------
+// Fire-and-forget warmup (ok if it just returns 200/204)
+async function ttsWarm() {
+  return fetch(u("/api/tts/warm"), { method: "POST" });
+}
+
+// Say: POST text -> returns an audio Blob (WAV/OGG depending on server)
+async function ttsSay(text) {
+  return getBlob(u("/api/tts/say"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
 }
 
 // -------------------- Export as object --------------------
-
 export const API = {
   base,
   // health
@@ -92,6 +105,6 @@ export const API = {
   simScore,
   simReport,
   // tts
-  tts: u("/api/tts"),
-  ttsWarm: u("/api/tts/warm"),
+  ttsWarm,
+  ttsSay,
 };

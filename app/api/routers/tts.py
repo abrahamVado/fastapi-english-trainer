@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response, JSONResponse
+import io, math, struct
 from app.schemas.tts import TTSRequest
 from app.core.config import settings
 
@@ -127,3 +128,35 @@ async def health():
         return JSONResponse(info)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Health failed: {e}")
+
+
+def gen_beep_wav(duration_s=1.0, freq=440.0, sr=16000):
+    n = int(duration_s * sr)
+    buf = io.BytesIO()
+    # --- write a minimal PCM16 WAV header + data ---
+    def write(fmt, *vals): buf.write(struct.pack(fmt, *vals))
+    # RIFF header
+    buf.write(b"RIFF")
+    write("<I", 36 + n*2)      # file size - 8
+    buf.write(b"WAVEfmt ")
+    write("<I", 16)            # PCM chunk size
+    write("<H", 1)             # PCM
+    write("<H", 1)             # mono
+    write("<I", sr)            # sample rate
+    write("<I", sr*2)          # byte rate
+    write("<H", 2)             # block align
+    write("<H", 16)            # bits per sample
+    buf.write(b"data")
+    write("<I", n*2)
+    # samples
+    for i in range(n):
+        s = int(32767 * math.sin(2*math.pi*freq*i/sr))
+        write("<h", s)
+    buf.seek(0)
+    return buf
+
+@router.post("/say")
+async def tts_say():
+    wav = gen_beep_wav()
+    return StreamingResponse(wav, media_type="audio/wav",
+                             headers={"Cache-Control": "no-store"})

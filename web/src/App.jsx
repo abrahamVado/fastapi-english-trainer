@@ -68,7 +68,7 @@ export default function App() {
   // -------------------------- Backend warmup (optional) ---------------------
   useEffect(() => {
     // warm TTS (non-blocking; ignore errors)
-    fetch(API.ttsWarm, { method: "POST" }).catch(() => {});
+    API.ttsWarm().catch(() => {});
     // Optional health check:
     // API.health().then(() => setStatus({ kind: "", text: "Backend OK — ready" })).catch(() => {});
   }, []);
@@ -110,7 +110,22 @@ export default function App() {
           const res = await API.simAnswerAudio(sid, qid, blob);
           const asr = res.asr_text || "(no speech detected)";
           addMessage("user", "text", asr);
+          const textToSpeak = asr;
+          // start simple: echo back what you said
 
+          // Warm TTS in background (optional)
+          API.ttsWarm().catch(()=>{});
+
+          // Get audio and play it
+          const audioBlob = await API.ttsSay(textToSpeak);
+          const url = URL.createObjectURL(audioBlob);
+          const audio = new Audio(url);
+          try {
+            await audio.play(); // make sure this runs as a result of a user gesture to avoid autoplay blocking
+          } catch (err) {
+            console.error("Playback blocked; show a play button:", err);
+          }
+          setTimeout(() => URL.revokeObjectURL(url), 30000);
           setStatus({ kind: "", text: "Ready" });
         } catch (e) {
           console.error(e);
