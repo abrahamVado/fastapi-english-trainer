@@ -1,162 +1,100 @@
 # app/api/routers/tts.py
-from __future__ import annotations
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
+import io, wave, math, struct, numpy as np
+from typing import Tuple, Union
+import logging
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import Response, JSONResponse
-import io, math, struct
-from app.schemas.tts import TTSRequest
-from app.core.config import settings
-
-# Choose engine
-if settings.TTS_ENGINE.lower() == "bark":
-    from app.services.tts.bark_service import BarkService as TTSImpl
-    _svc = TTSImpl(
-        voice_preset=settings.BARK_VOICE,
-        text_temp=settings.BARK_TEXT_TEMP,
-        waveform_temp=settings.BARK_WAVEFORM_TEMP,
-        use_small_default=getattr(settings, "BARK_USE_SMALL_DEFAULT", False),
-    )
-else:
-    # If you keep Piper around, it can act as a simple fallback TTS.
-    from app.services.tts.piper_service import PiperService as TTSImpl
-    _svc = TTSImpl(settings.PIPER_VOICE)
-
+log = logging.getLogger("tts")
 router = APIRouter(prefix="/tts", tags=["tts"])
 
+def _ensure_array(audio: Union[np.ndarray, list]) -> np.ndarray:
+    if audio is None:
+        return np.zeros((0,), dtype=np.float32)
+    if not isinstance(audio, np.ndarray):
+        audio = np.asarray(audio, dtype=np.float32)
+    else:
+        audio = audio.astype(np.float32, copy=False)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    return audio
 
-@router.post("")
-async def synth(req: TTSRequest):
-    """
-    Non-streaming TTS. Returns a single WAV buffer (audio/wav).
-    Body: { text, voice?, use_small?, seed?, text_temp?, waveform_temp? }
-    """
-    try:
-        wav: bytes = await _svc.synthesize_bytes(
-            text=req.text,
-            voice=req.voice,
-            use_small=req.use_small,
-            seed=req.seed,
-            text_temp=req.text_temp,
-            waveform_temp=req.waveform_temp,
-        )
-        return Response(
-            content=wav,
-            media_type="audio/wav",
-            headers={"Content-Disposition": 'inline; filename="speech.wav"'},
-        )
-    except Exception as e:
-        # Log if you have a logger; return sanitized error to client
-        raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
+def _to_mono_f32(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim == 1:
+        return audio
+    if audio.ndim == 2:
+        return audio.mean(axis=1, dtype=np.float32) if audio.shape[1] else np.zeros((0,), np.float32)
+    return audio.reshape(-1).astype(np.float32, copy=False)
 
-
-@router.get("")
-async def synth_query(text: str, voice: str | None = None):
-    """
-    Convenience GET form: /api/tts?text=Hello&voice=v2/en_speaker_6
-    Useful for quick manual tests in the browser.
-    """
-    try:
-        wav = await _svc.synthesize_bytes(text=text, voice=voice)
-        return Response(
-            content=wav,
-            media_type="audio/wav",
-            headers={"Content-Disposition": 'inline; filename="speech.wav"'},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
-
-
-@router.post("/warm")
-async def warm(use_small: bool | None = None):
-    """
-    Preload Bark models into memory. Pass use_small=true for "small" models.
-
-    IMPORTANT:
-    - Bark has multiple versions with different preload signatures.
-      This endpoint tolerates those differences and never crashes the app.
-    - If Piper is selected, warm is a no-op (returns ok=True).
-    """
-    # If you’re not using Bark, just no-op successfully.
-    if settings.TTS_ENGINE.lower() != "bark":
-        return JSONResponse({"ok": True, "detail": "warmup not required for this TTS engine"})
-
-    # Some BarkService implementations expose warm_models as @classmethod.
-    warm_fn = getattr(_svc, "warm_models", None)
-    if warm_fn is None:
-        # Not exposed → treat as no-op
-        return JSONResponse({"ok": True, "detail": "warm_models not available"})
-
-    # Try with the provided flag first; fall back to no-arg call on TypeError.
-    try:
-        if use_small is None:
-            warm_fn()  # tolerant Bark builds accept no args
-        else:
-            warm_fn(use_small=bool(use_small))
-        return JSONResponse({"ok": True, "use_small": bool(use_small) if use_small is not None else None})
-    except TypeError:
-        # Signature mismatch (e.g., older Bark that accepts no kwargs)
-        try:
-            warm_fn()
-            return JSONResponse({"ok": True, "use_small": None, "detail": "warm called without kwargs"})
-        except Exception as e2:
-            return JSONResponse({"ok": False, "detail": f"{e2}"})
-    except Exception as e:
-        # Do not 500 here; let the frontend proceed even if warm failed.
-        return JSONResponse({"ok": False, "detail": f"{e}"})
-
-
-@router.get("/health")
-async def health():
-    """
-    Quick health check for the TTS subsystem (engine + device + warm flags).
-    """
-    try:
-        info = {
-            "ok": True,
-            "engine": settings.TTS_ENGINE.lower(),
-        }
-        try:
-            import torch  # optional diagnostic
-            info["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            info["device"] = "unknown"
-
-        # Expose BarkService warm flags if present
-        for attr in ("_is_warmed_full", "_is_warmed_small"):
-            if hasattr(_svc, attr):
-                info[attr] = bool(getattr(_svc, attr))
-        return JSONResponse(info)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Health failed: {e}")
-
-
-def gen_beep_wav(duration_s=1.0, freq=440.0, sr=16000):
-    n = int(duration_s * sr)
+def float_to_pcm16_wav(audio: Union[np.ndarray, list], sr: int = 22050) -> io.BytesIO:
+    audio = _ensure_array(audio)
+    audio = _to_mono_f32(audio)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm16 = (audio * 32767.0).astype(np.int16, copy=False)
     buf = io.BytesIO()
-    # --- write a minimal PCM16 WAV header + data ---
-    def write(fmt, *vals): buf.write(struct.pack(fmt, *vals))
-    # RIFF header
-    buf.write(b"RIFF")
-    write("<I", 36 + n*2)      # file size - 8
-    buf.write(b"WAVEfmt ")
-    write("<I", 16)            # PCM chunk size
-    write("<H", 1)             # PCM
-    write("<H", 1)             # mono
-    write("<I", sr)            # sample rate
-    write("<I", sr*2)          # byte rate
-    write("<H", 2)             # block align
-    write("<H", 16)            # bits per sample
-    buf.write(b"data")
-    write("<I", n*2)
-    # samples
-    for i in range(n):
-        s = int(32767 * math.sin(2*math.pi*freq*i/sr))
-        write("<h", s)
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(pcm16.tobytes())
     buf.seek(0)
     return buf
 
+def gen_beep_wav(duration_s: float = 0.4, freq: float = 880.0, sr: int = 16000) -> io.BytesIO:
+    n = int(duration_s * sr)
+    buf = io.BytesIO()
+    def w(fmt, *v): buf.write(struct.pack(fmt, *v))
+    buf.write(b"RIFF"); w("<I", 36 + n*2); buf.write(b"WAVEfmt ")
+    w("<I", 16); w("<H", 1); w("<H", 1); w("<I", sr); w("<I", sr*2); w("<H", 2); w("<H", 16)
+    buf.write(b"data"); w("<I", n*2)
+    for i in range(n):
+        s = int(32767 * math.sin(2*math.pi*freq*i/sr))
+        w("<h", s)
+    buf.seek(0)
+    return buf
+
+async def _run_synth(text: str) -> Tuple[np.ndarray, int]:
+    # TODO: change this import to your real TTS implementation
+    # from app.services.tts.my_tts import synth
+    from app.services.tts.my_tts import synth  # <-- verify this path exists
+    result = synth(text)
+    if hasattr(result, "__await__"):  # coroutine?
+        audio, sr = await result
+    else:
+        audio, sr = result
+    return audio, int(sr)
+
 @router.post("/say")
-async def tts_say():
-    wav = gen_beep_wav()
-    return StreamingResponse(wav, media_type="audio/wav",
-                             headers={"Cache-Control": "no-store"})
+async def tts_say(req: dict):
+    text = (req.get("text") or "").strip()
+    if not text:
+        text = "Hello"
+    log.warning(f"[TTS] request text='{text[:64]}'")
+
+    try:
+        audio, sr = await _run_synth(text)
+        audio = _ensure_array(audio)
+        if audio.size == 0:
+            log.error("[TTS] synth returned empty audio")
+            wav = gen_beep_wav()
+            return StreamingResponse(
+                wav, media_type="audio/wav",
+                headers={"Cache-Control": "no-store", "X-TTS-Empty": "1"}
+            )
+        wav = float_to_pcm16_wav(audio, sr)
+        size = wav.getbuffer().nbytes
+        log.warning(f"[TTS] ok sr={sr} samples={audio.size} bytes={size}")
+        return StreamingResponse(wav, media_type="audio/wav",
+                                 headers={"Cache-Control": "no-store",
+                                          "X-TTS-SR": str(sr),
+                                          "X-TTS-Samples": str(audio.size)})
+    except Exception as e:
+        log.exception("[TTS] synth failed")
+        wav = gen_beep_wav()
+        return StreamingResponse(
+            wav, media_type="audio/wav",
+            headers={"Cache-Control": "no-store", "X-TTS-Error": type(e).__name__}
+        )
+
+@router.post("/warm")
+async def tts_warm():
+    return {"ok": True}

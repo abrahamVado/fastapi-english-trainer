@@ -118,6 +118,7 @@ export default function App() {
 
           // Get audio and play it
           const audioBlob = await API.ttsSay(textToSpeak);
+          console.log("TTS blob:", audioBlob.type, audioBlob.size);
           const url = URL.createObjectURL(audioBlob);
           const audio = new Audio(url);
           try {

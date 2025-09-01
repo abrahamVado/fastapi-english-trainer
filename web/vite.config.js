@@ -4,25 +4,39 @@ import react from "@vitejs/plugin-react";
 import fs from "fs";
 import path from "path";
 
-const certDir = path.resolve(__dirname, "../certs"); // <-- parent folder
+// Use the mkcert files you created for trainer.local
+// Example if you placed them in ../certs:
+//   trainer.local+1.pem          (cert)
+//   trainer.local+1-key.pem      (key)
+const certDir = path.resolve(__dirname, "../cerd");
 
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: true,               // expose on LAN
+    host: true,           // LAN access
     port: 5173,
     https: {
-      key:  fs.readFileSync(path.join(certDir, "server.key")),
-      cert: fs.readFileSync(path.join(certDir, "server.crt")), // <-- .crt
+      key:  fs.readFileSync(path.join(certDir, "localhost+1-key.pem")),
+      cert: fs.readFileSync(path.join(certDir, "localhost+1.pem")),
     },
     origin: "https://trainer.local:5173",
     hmr: {
       host: "trainer.local",
       protocol: "wss",
       port: 5173,
-      // If still flaky behind a proxy/VPN, try:
-      // clientPort: 5173,
-      // overlay: true,
+    },
+    // 🚀 Proxy API to backend to avoid CORS
+    proxy: {
+      "/api": {
+        target: "https://trainer.local:8000",
+        changeOrigin: true,
+        secure: false, // backend uses mkcert/self-signed
+      },
+      "/health": {
+        target: "https://trainer.local:8000",
+        changeOrigin: true,
+        secure: false,
+      },
     },
   },
 });
