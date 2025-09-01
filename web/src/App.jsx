@@ -1,20 +1,14 @@
 // src/App.jsx
 /**
  * App.jsx — Main UI for your English Trainer / Voice Assistant
- *
- * Uses a single API object (import { API } from "./api") for all backend calls:
- *   - API.health()
- *   - API.simStart(), API.simNext(), API.simAnswerAudio(), API.simScore(), API.simReport()
- *   - API.tts (URL), API.ttsWarm (URL)
- *
  * Flow:
- *  - Record with useRecorder → onBlob gets audio → ensure session → API.simAnswerAudio
- *  - Control bar: Start / Next / Score actions hit the API.* methods
- *  - TTS warm on mount; speak() posts to API.tts
+ *  - Record → upload audio (sim/answer/audio)
+ *  - LLM reply → speak via TTS (tts/say with use_llm=true, using sim store)
+ *  - Optional: Score / Next question
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { API } from "./api";                      // ✅ single import for all endpoints/URLs
+import { API } from "./api";
 import StatusChip from "./components/StatusChip.jsx";
 import Bubble from "./components/Bubble.jsx";
 import { useRecorder } from "./hooks/useRecorder.js";
@@ -47,7 +41,16 @@ export default function App() {
   const [sessionId, setSessionId] = useState(null);
   const [questionId, setQuestionId] = useState(null);
   const [question, setQuestion] = useState("");
-  const [lastScores, setLastScores] = useState(null); // { content, pronunciation, fluency, overall }
+  const [lastScores, setLastScores] = useState(null);
+
+  // simple fixed context (keep it in sync with your backend expectations)
+  const ROLE  = "developer";
+  const LEVEL = "senior";
+  const MODE  = "interview";
+
+  // anti-duplicate guards
+  const onBlobLock = useRef(false);
+  const reqIdRef = useRef(null);
 
   // auto-scroll
   const conversationRef = useRef(null);
@@ -67,37 +70,34 @@ export default function App() {
 
   // -------------------------- Backend warmup (optional) ---------------------
   useEffect(() => {
-    // warm TTS (non-blocking; ignore errors)
-    API.ttsWarm().catch(() => {});
-    // Optional health check:
-    // API.health().then(() => setStatus({ kind: "", text: "Backend OK — ready" })).catch(() => {});
+    API.ttsWarm().catch(() => {}); // non-blocking
   }, []);
 
   // ----------------------------- Recorder -----------------------------------
-  /**
-   * useRecorder:
-   * - start(): begin mic capture (browser prompts permission on first use)
-   * - stop(): finish → calls our onBlob(blob)
-   * - isRecording / isProcessing: control UI states
-   */
 
-  // onBlob runs after a recording finishes:
-  // - ensure we have a session/question (auto-start if missing)
-  // - upload audio to API.simAnswerAudio
-  // - add the recognized text to the chat
   const onBlob = useCallback(
     (blob) => {
-      addMessage("user", "audio", blob);
-      setStatus({ kind: "warn", text: "Transcribing…" });
-
       (async () => {
         try {
+          // 💡 lock immediately to prevent duplicate runs
+          if (onBlobLock.current) return;
+          onBlobLock.current = true;
+
+          // consistent request id across both requests
+          reqIdRef.current =
+            (globalThis.crypto && crypto.randomUUID && crypto.randomUUID()) ||
+            Math.random().toString(36).slice(2);
+
+          // UI feedback
+          addMessage("user", "audio", blob);
+          setStatus({ kind: "warn", text: "Transcribing…" });
+
           let sid = sessionId;
           let qid = questionId;
 
           // Auto-start if user recorded before hitting Start
           if (!sid || !qid) {
-            const s = await API.simStart({ role: "developer", level: "senior", mode: "interview" });
+            const s = await API.simStart({ role: ROLE, level: LEVEL, mode: MODE });
             sid = s.session_id;
             qid = s.question_id;
             setSessionId(sid);
@@ -106,34 +106,65 @@ export default function App() {
             addMessage("bot", "text", s.question);
           }
 
-          // Upload audio for current question
-          const res = await API.simAnswerAudio(sid, qid, blob);
-          const asr = res.asr_text || "(no speech detected)";
+          // Upload audio for current question → ASR text
+          const form = new FormData();
+          form.append("session_id", sid);
+          form.append("question_id", qid);
+          form.append("audio", new File([blob], "answer.webm", { type: blob.type || "audio/webm" }));
+
+          const asrRes = await fetch(`${API.base}/api/sim/answer/audio`, {
+            method: "POST",
+            headers: { "X-Req-Id": reqIdRef.current },
+            body: form,
+          });
+          if (!asrRes.ok) throw new Error(`sim/answer/audio -> ${asrRes.status}`);
+          const asrJson = await asrRes.json();
+          const asr = asrJson.asr_text || "(no speech detected)";
           addMessage("user", "text", asr);
-          const textToSpeak = asr;
-          // start simple: echo back what you said
 
-          // Warm TTS in background (optional)
-          API.ttsWarm().catch(()=>{});
+          // 🔊 Ask tutor (LLM) based on the recorded answer and speak it via TTS
+          setStatus({ kind: "busy", text: "Tutor thinking… then speaking reply…" });
+          const ttsRes = await fetch(`${API.base}/api/tts/say`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Req-Id": reqIdRef.current,
+            },
+            body: JSON.stringify({
+              use_llm: true,
+              session_id: sid,
+              question_id: qid,
+              role: ROLE,
+              level: LEVEL,
+              mode: MODE,
+            }),
+          });
+          if (!ttsRes.ok) throw new Error(`tts/say -> ${ttsRes.status}`);
+          const wav = await ttsRes.blob();
 
-          // Get audio and play it
-          const audioBlob = await API.ttsSay(textToSpeak);
-          console.log("TTS blob:", audioBlob.type, audioBlob.size);
-          const url = URL.createObjectURL(audioBlob);
+          // Play returned WAV
+          const url = URL.createObjectURL(wav);
           const audio = new Audio(url);
           try {
-            await audio.play(); // make sure this runs as a result of a user gesture to avoid autoplay blocking
+            await audio.play();
           } catch (err) {
             console.error("Playback blocked; show a play button:", err);
+          } finally {
+            // keep it around briefly in case of replay UI; then cleanup
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
           }
-          setTimeout(() => URL.revokeObjectURL(url), 30000);
+
+          // show a “bot audio” bubble if your <Bubble> supports it
+          addMessage("bot", "audio", wav);
+
           setStatus({ kind: "", text: "Ready" });
         } catch (e) {
           console.error(e);
-          addMessage("bot", "text", "Error: audio upload/transcription failed.");
-          setStatus({ kind: "err", text: "Audio error" });
+          addMessage("bot", "text", "Error: audio upload/LLM-TTS failed.");
+          setStatus({ kind: "err", text: "Audio/LLM error" });
         } finally {
           setIsProcessing(false);
+          onBlobLock.current = false; // ✅ always release
         }
       })();
     },
@@ -156,7 +187,7 @@ export default function App() {
   async function handleStart() {
     setStatus({ kind: "busy", text: "Starting session..." });
     try {
-      const res = await API.simStart({ role: "developer", level: "senior", mode: "interview" });
+      const res = await API.simStart({ role: ROLE, level: LEVEL, mode: MODE });
       setSessionId(res.session_id);
       setQuestionId(res.question_id);
       setQuestion(res.question);
@@ -191,7 +222,11 @@ export default function App() {
     try {
       const res = await API.simScore({ session_id: sessionId, question_id: questionId });
       setLastScores(res.scores);
-      addMessage("bot", "text", `Overall: ${res.scores.overall} — Tips: ${res.tips.join(" | ")}`);
+      addMessage(
+        "bot",
+        "text",
+        `Overall: ${res.scores.overall} — Tips: ${res.tips.join(" | ")}`
+      );
       setStatus({ kind: "", text: "Scored" });
     } catch (e) {
       console.error(e);
@@ -199,34 +234,18 @@ export default function App() {
     }
   }
 
-  // Speak a bot reply via backend TTS
-  const speak = useCallback(
-    async (text) => {
-      try {
-        const res = await fetch(API.tts, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, voice: "v2/es_speaker_0" }),
-        });
-        if (!res.ok) {
-          console.warn("TTS failed", await res.text());
-          return;
-        }
-        const blob = await res.blob(); // e.g. WAV
-        addMessage("bot", "audio", blob);
-      } catch (e) {
-        console.warn("TTS error", e);
-      }
-    },
-    [addMessage]
-  );
-
   // auto-scroll to newest message
-  const scrollToBottom = useCallback(() => {
+  const conversationRefCb = useCallback(
+    (node) => {
+      conversationRef.current = node;
+      if (node) node.scrollTop = node.scrollHeight;
+    },
+    []
+  );
+  useEffect(() => {
     const el = conversationRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, []);
-  useEffect(scrollToBottom, [chats, scrollToBottom]);
+  }, [chats]);
 
   const currentMessages = useMemo(
     () => chats.find((c) => c.id === currentChatId)?.messages || [],
@@ -260,8 +279,8 @@ export default function App() {
                 {lastScores && (
                   <div style={{ marginTop: 6 }}>
                     <strong>Scores:</strong>{" "}
-                    content {lastScores.content}, pron {lastScores.pronunciation}, fluency {lastScores.fluency},{" "}
-                    <strong>overall {lastScores.overall}</strong>
+                    content {lastScores.content}, pron {lastScores.pronunciation}, fluency{" "}
+                    {lastScores.fluency}, <strong>overall {lastScores.overall}</strong>
                   </div>
                 )}
               </div>
@@ -272,7 +291,7 @@ export default function App() {
                 role="log"
                 aria-live="polite"
                 aria-relevant="additions"
-                ref={conversationRef}
+                ref={conversationRefCb}
               >
                 {currentMessages.map((m, i) => (
                   <Bubble m={m} key={i} />

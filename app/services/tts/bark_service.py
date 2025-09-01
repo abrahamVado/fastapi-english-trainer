@@ -167,8 +167,7 @@ class BarkService:
                     ch,
                     history_prompt=preset,
                     text_temp=tt,
-                    waveform_temp=wt,
-                    seed=seed,
+                    waveform_temp=wt
                 )
                 audio_all = audio if audio_all is None else np.concatenate([audio_all, audio])
 

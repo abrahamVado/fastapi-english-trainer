@@ -1,7 +1,7 @@
 // src/api.js
 // Centralized API client for the frontend
 
-// IMPORTANT: set this in web/.env.development:
+// IMPORTANT: set this in web/.env.development (or your Vite env):
 //   VITE_API_BASE_URL=https://trainer.local:8000
 const base =
   (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_BASE_URL) ||
@@ -21,14 +21,12 @@ async function getBlob(url, opts) {
   return r.blob();
 }
 
-// -------------------- API methods --------------------
-
-// Health check
+// -------------------- Health --------------------
 async function health() {
   return getJSON(u("/health"));
 }
 
-// Simulation
+// -------------------- Simulation --------------------
 async function simStart(payload) {
   return getJSON(u("/api/sim/start"), {
     method: "POST",
@@ -78,12 +76,12 @@ async function simReport(session_id) {
 }
 
 // -------------------- TTS --------------------
-// Fire-and-forget warmup (ok if it just returns 200/204)
+// Warmup (optional)
 async function ttsWarm() {
   return fetch(u("/api/tts/warm"), { method: "POST" });
 }
 
-// Say: POST text -> returns an audio Blob (WAV/OGG depending on server)
+// Plain say (no LLM): returns a WAV Blob
 async function ttsSay(text) {
   return getBlob(u("/api/tts/say"), {
     method: "POST",
@@ -92,7 +90,36 @@ async function ttsSay(text) {
   });
 }
 
-// -------------------- Export as object --------------------
+// LLM->TTS from sim store (use last ASR answer)
+async function ttsSayLLMFromSim(session_id, question_id, ctx = {}) {
+  const payload = {
+    use_llm: true,
+    session_id,
+    question_id,
+    ...ctx, // role, level, mode, llm_model (optional)
+  };
+  return getBlob(u("/api/tts/say"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// LLM->TTS from arbitrary text
+async function ttsSayLLMFromText(text, ctx = {}) {
+  const payload = {
+    use_llm: true,
+    text,
+    ...ctx, // role, level, mode, llm_model (optional)
+  };
+  return getBlob(u("/api/tts/say"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// -------------------- Export --------------------
 export const API = {
   base,
   // health
@@ -107,4 +134,6 @@ export const API = {
   // tts
   ttsWarm,
   ttsSay,
+  ttsSayLLMFromSim,
+  ttsSayLLMFromText,
 };

@@ -107,6 +107,20 @@ app.include_router(sessions.router, prefix=settings.API_PREFIX)
 app.include_router(sim.router,      prefix=settings.API_PREFIX)
 app.include_router(ipa.router,      prefix=settings.API_PREFIX)
 app.include_router(gpu.router,      prefix=settings.API_PREFIX)
+
+
+
+@app.on_event("startup")
+async def _list_routes():
+    from fastapi.routing import APIRoute
+    print("\n=== ROUTES ===")
+    for r in app.router.routes:
+        if isinstance(r, APIRoute):
+            methods = ",".join(sorted(r.methods))
+            print(f"{methods:10} {r.path}")
+    print("==============\n")
+
+
 # ---------------------------------------------------------------------
 # 5. Optional root endpoint (nice for humans)
 # ---------------------------------------------------------------------

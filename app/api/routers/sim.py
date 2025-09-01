@@ -213,3 +213,35 @@ def sim_report(session_id: str):
         } for t in turns],
         overall_avg=avg
     )
+
+@router.post("/answer/llm")
+async def sim_answer_llm(session_id: str, question_id: str):
+    turns = _TURNS.get(session_id)
+    if not turns:
+        raise HTTPException(status_code=404, detail="session not found")
+    t = next((t for t in turns if t["qid"] == question_id), None)
+    if not t:
+        raise HTTPException(status_code=404, detail="question not found")
+
+    sess = _SESS.get(session_id, {})
+    role  = sess.get("role", "")
+    level = sess.get("level", "")
+    mode  = sess.get("mode", "")
+
+    user_text = (t.get("answer_text") or "").strip()
+    if not user_text:
+        # If no ASR yet, rephrase the question so the conversation continues
+        user_text = f"(No answer captured yet.) The question was: {t.get('q','')}"
+
+    reply = await _judge.a_tutor_reply(
+        user_text,
+        role=role,
+        level=level,
+        mode=mode,
+        # model=None -> use OLLAMA_MODEL env (e.g. llama3.1)
+        max_tokens=256,
+        temperature=0.6,
+    )
+    t["tutor_reply"] = reply  # optional persistence for UI
+
+    return {"reply": reply}

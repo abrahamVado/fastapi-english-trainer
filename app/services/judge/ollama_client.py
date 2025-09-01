@@ -15,7 +15,13 @@ DEFAULT_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_URL = os.getenv("OLLAMA_URL", "")  # if provided, can be full /api/generate
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 GENERATE_PATH = "/api/generate"
-
+SYSTEM_TUTOR_PROMPT = (
+    "You are a friendly English conversation tutor. "
+    "Be clear, encouraging, and concise. Use B1–B2 vocabulary. "
+    "Correct mistakes gently with 1–2 examples. "
+    "Ask one short follow-up question to keep the conversation going. "
+    "Avoid long monologues."
+)
 
 def _normalize_url(host: Optional[str], url: Optional[str]) -> str:
     """
@@ -265,3 +271,61 @@ class OllamaJudge:
         txt = self.generate(prompt, model=model, options=options)
         obj = _extract_last_json_block(txt)
         return obj or {"score": 0, "key_points": [], "gaps": [], "tips": ["(ollama parse error)"]}
+    # ------------------------- Tutor / Chat helpers ---------------------------
+
+    def _build_tutor_prompt(
+        self, user_text: str, role: str = "", level: str = "", mode: str = ""
+    ) -> str:
+        context = []
+        if role:  context.append(f"Role: {role}")
+        if level: context.append(f"Level: {level}")
+        if mode:  context.append(f"Mode: {mode}")
+        ctx = "\n".join(f"- {c}" for c in context) if context else "- (none)"
+        return (
+            f"{SYSTEM_TUTOR_PROMPT}\n\n"
+            f"Context:\n{ctx}\n\n"
+            f"User said:\n{user_text}\n\n"
+            f"Your response (1–3 short paragraphs max):"
+        )
+
+    async def a_tutor_reply(
+        self,
+        user_text: str,
+        role: str = "",
+        level: str = "",
+        mode: str = "",
+        model: Optional[str] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.6,
+    ) -> str:
+        prompt = self._build_tutor_prompt(user_text, role, level, mode)
+        txt = await self.a_generate(
+            prompt,
+            model=model,
+            options={
+                "num_predict": max_tokens,
+                "temperature": temperature,
+            },
+        )
+        return (txt or "").strip()
+
+    def tutor_reply(
+        self,
+        user_text: str,
+        role: str = "",
+        level: str = "",
+        mode: str = "",
+        model: Optional[str] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.6,
+    ) -> str:
+        prompt = self._build_tutor_prompt(user_text, role, level, mode)
+        txt = self.generate(
+            prompt,
+            model=model,
+            options={
+                "num_predict": max_tokens,
+                "temperature": temperature,
+            },
+        )
+        return (txt or "").strip()
