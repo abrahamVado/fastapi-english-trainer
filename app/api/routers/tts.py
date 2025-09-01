@@ -55,7 +55,7 @@ def gen_beep_wav(duration_s: float = 0.4, freq: float = 880.0, sr: int = 16000) 
 async def _run_synth(text: str) -> Tuple[np.ndarray, int]:
     # TODO: change this import to your real TTS implementation
     # from app.services.tts.my_tts import synth
-    from app.services.tts.my_tts import synth  # <-- verify this path exists
+    from app.services.tts.bark_tts import synth  # <-- verify this path exists
     result = synth(text)
     if hasattr(result, "__await__"):  # coroutine?
         audio, sr = await result
