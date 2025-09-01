@@ -208,3 +208,171 @@ body{
 .conversation-container .record-btn svg{
   width:28px; height:28px; filter:drop-shadow(0 2px 2px rgba(0,0,0,.35));
 }
+
+/* --- Control bar container --- */
+.controlbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 999px;           /* pill shape */
+  background: #fff;
+  box-shadow:
+    0 1px 2px rgba(0,0,0,0.06),
+    0 6px 18px rgba(0,0,0,0.06);
+}
+
+/* --- Buttons --- */
+.btn {
+  appearance: none;
+  border: 1px solid rgba(0,0,0,0.12);
+  background: #f9fafb;
+  padding: 10px 14px;
+  border-radius: 999px;           /* pill */
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.btn:hover {
+  background: #ffffff;
+  border-color: rgba(0,0,0,0.18);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+}
+
+.btn:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* Accent for primary action */
+.btn--primary {
+  background: #2563eb;           /* blue-600 */
+  color: #fff;
+  border-color: #2563eb;
+}
+.btn--primary:hover {
+  background: #1e40af;           /* blue-800 */
+  border-color: #1e40af;
+}
+
+/* Optional: make the whole bar compact on small screens */
+@media (max-width: 480px) {
+  .controlbar {
+    gap: 8px;
+    padding: 8px 10px;
+  }
+  .btn {
+    padding: 9px 12px;
+    font-size: 13px;
+  }
+}
+/* --- Container strip --- */
+.controlbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 50px;
+}
+
+/* --- Shared sim-btn style (pill shape like record-btn) --- */
+.sim-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  transition: transform 0.15s ease, background 0.2s ease;
+}
+
+.sim-btn svg {
+  width: 26px;
+  height: 26px;
+}
+
+.sim-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- Color themes --- */
+.sim-btn--start {
+  background: #2563eb; /* blue */
+}
+.sim-btn--start:hover:not(:disabled) {
+  background: #1d4ed8;
+  transform: scale(1.05);
+}
+
+.sim-btn--next {
+  background: #16a34a; /* green */
+}
+.sim-btn--next:hover:not(:disabled) {
+  background: #15803d;
+  transform: scale(1.05);
+}
+
+.sim-btn--score {
+  background: #9333ea; /* purple */
+}
+.sim-btn--score:hover:not(:disabled) {
+  background: #7e22ce;
+  transform: scale(1.05);
+}
+/* --- Tooltip wrapper --- */
+.tooltip {
+  position: relative;
+  display: inline-block;
+}
+
+/* --- Tooltip bubble --- */
+.tooltip-text {
+  visibility: hidden;
+  opacity: 0;
+  position: absolute;
+  bottom: 120%; /* show above the button */
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0,0,0,0.8);
+  color: #fff;
+  text-align: center;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  transition: opacity 0.2s ease;
+  z-index: 10;
+}
+
+/* --- Small arrow under tooltip --- */
+.tooltip-text::after {
+  content: "";
+  position: absolute;
+  top: 100%; /* bottom edge of bubble */
+  left: 50%;
+  margin-left: -5px;
+  border-width: 5px;
+  border-style: solid;
+  border-color: rgba(0,0,0,0.8) transparent transparent transparent;
+}
+
+/* --- Show tooltip on hover --- */
+.tooltip:hover .tooltip-text {
+  visibility: visible;
+  opacity: 1;
+}

@@ -2,6 +2,8 @@
 from __future__ import annotations
 import io, re, wave, os, asyncio
 import numpy as np
+import inspect 
+
 
 # Bark 0.1.5 can expose APIs in slightly different places; make this robust.
 try:
@@ -50,19 +52,56 @@ class BarkService:
 
     @classmethod
     def warm_models(cls, *, use_small: bool = False):
-        # Avoid reloading while still allowing both modes to be warmed independently.
-        if use_small and not cls._is_warmed_small:
-            preload_models(
-                text_use_small=True, coarse_use_small=True,
-                fine_use_small=True, codec_use_small=True
-            )
+        """
+        Version-tolerant warmup:
+        - If this Bark build accepts per-stage small flags, pass only the ones it supports.
+        - If it only accepts `use_small`, pass that.
+        - If it accepts no kwargs, call with no args.
+        - Also toggles SUNO_USE_SMALL_MODELS for older releases.
+        """
+        # avoid duplicate warmups
+        if use_small and cls._is_warmed_small:
+            return
+        if (not use_small) and cls._is_warmed_full:
+            return
+
+        # some Bark builds respect this env var only
+        os.environ["SUNO_USE_SMALL_MODELS"] = "true" if use_small else "false"
+
+        # figure out what preload_models actually accepts
+        try:
+            sig = inspect.signature(preload_models)
+            supported = set(sig.parameters.keys())
+        except Exception:
+            supported = set()
+
+        # candidate kwargs across versions
+        desired_kwargs = {
+            "use_small": use_small,                 # some versions
+            "text_use_small": use_small,            # others
+            "coarse_use_small": use_small,
+            "fine_use_small": use_small,
+            "codec_use_small": use_small,           # may be missing (causing your error)
+        }
+
+        # keep only supported kwargs
+        filtered = {k: v for k, v in desired_kwargs.items() if k in supported}
+
+        # try the most specific first, then fall back
+        try:
+            if filtered:
+                preload_models(**filtered)
+            else:
+                preload_models()
+        except TypeError:
+            # signature mismatch → final fallback
+            preload_models()
+
+        if use_small:
             cls._is_warmed_small = True
-        elif (not use_small) and (not cls._is_warmed_full):
-            preload_models(
-                text_use_small=False, coarse_use_small=False,
-                fine_use_small=False, codec_use_small=False
-            )
+        else:
             cls._is_warmed_full = True
+
 
     @staticmethod
     def _to_wav_bytes(samples: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:

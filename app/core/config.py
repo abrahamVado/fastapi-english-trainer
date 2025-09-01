@@ -1,9 +1,12 @@
-from pydantic import BaseSettings
+# app/core/config.py
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
 
 class Settings(BaseSettings):
     ENV: str = "dev"
     API_PREFIX: str = "/api"
-    CORS_ORIGINS: list[str] = ["*"]
+    CORS_ORIGINS: List[str] = ["*"]
     LOG_LEVEL: str = "INFO"
     DATABASE_URL: str = "sqlite:///./english.db"
     WHISPER_MODEL: str = "base"
@@ -14,7 +17,10 @@ class Settings(BaseSettings):
     BARK_TEXT_TEMP: float = 0.7
     BARK_WAVEFORM_TEMP: float = 0.7    
 
-    class Config:
-        env_file = ".env"
+    # pydantic v2 settings
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",   # ignore unknown env vars instead of raising errors
+    )
 
 settings = Settings()
