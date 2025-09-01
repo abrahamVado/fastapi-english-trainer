@@ -1,69 +1,39 @@
-# React + TypeScript + Vite
+# Voice Assistant — Conversation (React + Vite)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This is a minimal React app to send microphone audio to your Python API and display the conversation. **Agents sidebar and Reader mode were removed** per your request.
 
-Currently, two official plugins are available:
+## Quick start
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      ...tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      ...tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      ...tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# inside the extracted folder
+npm i
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Open the printed local URL.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Configure API endpoint
 
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+By default, the app POSTs to `/api/audio`:
+
+- Create a `.env` file to override:
 ```
+VITE_API_AUDIO=http://localhost:8000/api/audio
+```
+
+Restart the dev server after changing envs.
+
+## How it works
+
+- Click the mic (or hold **Space**) to record; release to stop & send.
+- Audio is sent as `multipart/form-data` with fields:
+  - `file`: the recorded audio blob (WebM/Opus or OGG/Opus depending on browser support).
+  - `mode`: `"conversation"` (for parity with your backend).
+- The response is expected to be JSON: `{ "answer": "..." }`.
+- Messages (user audio + bot text) render as bubbles.
+
+## Files of interest
+
+- `src/hooks/useRecorder.js` — MediaRecorder + push‑to‑talk logic
+- `src/App.jsx` — conversation-only UI
+- `public/styles.css` — drop your existing stylesheet here (class names preserved)

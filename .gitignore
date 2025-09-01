@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.env
+*.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# FastAPI
+instance/
+*.db
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Test coverage
+htmlcov/
+.coverage
+.tox/
+.nox/
+
+# Pytest
+.cache/
+
+# Mypy
+.mypy_cache/
+
+# Pipenv
+Pipfile.lock
+
+# Virtualenv
+*.egg-info/
+dist/
+build/
+
+web/node_modules/
