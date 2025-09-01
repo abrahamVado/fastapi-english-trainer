@@ -29,6 +29,8 @@ from app.api.routers import (                      # All API routers (organized 
 )
 from app.lifespan import lifespan                  # Startup/shutdown event handler
 
+from dotenv import load_dotenv
+load_dotenv()  # will read .env in project root
 
 # ---------------------------------------------------------------------
 # 1. Configure logging
@@ -71,15 +73,16 @@ app = FastAPI(
 #
 # - `allow_methods`: Which HTTP methods are allowed (["*"] = all).
 # - `allow_headers`: Which headers are allowed (["*"] = all).
-# ---------------------------------------------------------------------
+# --------------------------------------------------------------------
+origins = ["https://trainer.local:5173"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=False,   # ⚠️ Set to True only if you list explicit origins, not "*"
-    allow_methods=["*"],
+    allow_origins=origins,
+    allow_credentials=True,        # set True only if you use cookies/auth headers
+    allow_methods=["GET","POST","OPTIONS","PUT","PATCH","DELETE"],
     allow_headers=["*"],
+    expose_headers=["*"],          # optional
 )
-
 
 # ---------------------------------------------------------------------
 # 4. Register Routers (modular endpoints)

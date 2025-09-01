@@ -97,15 +97,20 @@ async def sim_answer_audio(
         raise HTTPException(status_code=404, detail="question not found")
 
     data = await audio.read()
-    # Optional: pass initial_prompt or language hints to ASR in the future
-    asr_text = await _asr.transcribe(data, language="en")
+    # 👇 pass through actual MIME type (e.g., 'audio/webm;codecs=opus')
+    asr_text = await _asr.transcribe(
+        data,
+        language="en",
+        content_type=(audio.content_type or "")
+    )
     t["answer_text"] = asr_text or ""
     return SimAnswerAudioRes(
         session_id=session_id,
         question_id=question_id,
         asr_text=asr_text or "",
-        confidence=None,  # TODO: add from WhisperService if available
+        confidence=None,
     )
+
 
 
 @router.post("/score", response_model=SimScoreRes)
