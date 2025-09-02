@@ -1,10 +1,11 @@
 # app/api/routers/sim.py
 from __future__ import annotations
 
-import uuid
+import uuid, hashlib, time, logging
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Header
+from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.schemas.sim import (
@@ -16,8 +17,8 @@ from app.services.stt.whisper_service import WhisperService
 from app.services.judge.ollama_client import OllamaJudge
 from app.services.ipa.mapping import score_pronunciation
 
-
 router = APIRouter(prefix="/sim", tags=["sim"])
+log = logging.getLogger("sim")
 
 # --- Services (singletons) ---------------------------------------------------
 _asr = WhisperService(settings.WHISPER_MODEL)
@@ -28,6 +29,23 @@ _judge = OllamaJudge()  # async/sync capable per the improved client
 _SESS: Dict[str, Dict] = {}         # session_id -> {"role":..,"level":..,"mode":..}
 _TURNS: Dict[str, List[Dict]] = {}  # session_id -> [{qid, q, answer_text, ...}, ...]
 
+# --- Simple idempotency cache (swap for Redis in prod) ----------------------
+_IDEMP: Dict[str, tuple[int, dict]] = {}  # key -> (ts_ms, result_json)
+_IDEMP_TTL_MS = 5 * 60 * 1000
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _clean_idemp():
+    now = _now_ms()
+    for k in list(_IDEMP.keys()):
+        if now - _IDEMP[k][0] > _IDEMP_TTL_MS:
+            _IDEMP.pop(k, None)
+
+def _idem_key(client_key: Optional[str], audio_bytes: bytes) -> str:
+    h = hashlib.sha1(audio_bytes).hexdigest()
+    return f"{client_key or 'noid'}:{h}"
+
 # --- LLM rubric --------------------------------------------------------------
 _CONTENT_RUBRIC = """Grade content from 0-100:
 - Correctness (40)
@@ -37,16 +55,11 @@ _CONTENT_RUBRIC = """Grade content from 0-100:
 Return strict JSON: {"score":int,"key_points":[...],"gaps":[...],"tips":[...]}.
 """
 
-
 def _ask_first_question(role: str, level: str, mode: str) -> str:
-    # TODO: later: route to LLM interviewer based on role/level/mode
     return f"Tell me about a challenge you solved using {role} at {level} level."
 
-
 def _ask_followup(prev_answer: str) -> str:
-    # TODO: can be made smarter using prev_answer and LLM
     return "Thanks. Can you explain the trade-offs you considered?"
-
 
 # --- Endpoints ---------------------------------------------------------------
 
@@ -59,7 +72,6 @@ def sim_start(req: SimStartReq):
     _TURNS[sid] = [{"qid": qid, "q": q, "answer_text": ""}]
     return SimStartRes(session_id=sid, question_id=qid, question=q)
 
-
 @router.post("/next", response_model=SimNextRes)
 def sim_next(req: SimNextReq):
     if req.session_id not in _SESS:
@@ -69,7 +81,6 @@ def sim_next(req: SimNextReq):
     q = _ask_followup(last.get("answer_text", ""))
     _TURNS[req.session_id].append({"qid": qid, "q": q, "answer_text": ""})
     return SimNextRes(question_id=qid, question=q)
-
 
 @router.post("/answer/text")
 def sim_answer_text(req: SimAnswerTextReq):
@@ -82,12 +93,13 @@ def sim_answer_text(req: SimAnswerTextReq):
     t["answer_text"] = (req.text or "").strip()
     return {"ok": True}
 
-
 @router.post("/answer/audio", response_model=SimAnswerAudioRes)
 async def sim_answer_audio(
     session_id: str = Form(...),
     question_id: str = Form(...),
-    audio: UploadFile = File(...)
+    audio: UploadFile = File(...),
+    client_audio_id: Optional[str] = Form(None),
+    x_idempotency_key: Optional[str] = Header(None, convert_underscores=False),
 ):
     turns = _TURNS.get(session_id)
     if not turns:
@@ -97,30 +109,53 @@ async def sim_answer_audio(
         raise HTTPException(status_code=404, detail="question not found")
 
     data = await audio.read()
-    # 👇 pass through actual MIME type (e.g., 'audio/webm;codecs=opus')
+    if not data:
+        raise HTTPException(status_code=400, detail="empty audio upload")
+
+    # ---- Idempotency: same blob shouldn't be transcribed twice --------------
+    _clean_idemp()
+    idem = _idem_key(x_idempotency_key or client_audio_id, data)
+    if idem in _IDEMP:
+        cached = _IDEMP[idem][1]
+        t["answer_text"] = cached.get("asr_text", "") or ""
+        return JSONResponse(cached)
+
+    # ---- Build a small domain hint for ASR ----------------------------------
+    sess = _SESS.get(session_id, {})
+    initial_prompt = (
+        f"Interview context. Role: {sess.get('role','')}. "
+        f"Level: {sess.get('level','')}. Mode: {sess.get('mode','')}. "
+        "Common tech terms: Kubernetes, gRPC, PostgreSQL, TypeScript, React, Kafka, Terraform, AWS."
+    )
+
+    # 👇 Pass actual MIME (e.g., 'audio/webm;codecs=opus'). WhisperService should
+    #     handle VAD + no cross-chunk conditioning internally.
     asr_text = await _asr.transcribe(
         data,
         language="en",
+        initial_prompt=initial_prompt,
         content_type=(audio.content_type or "")
     )
-    t["answer_text"] = asr_text or ""
-    return SimAnswerAudioRes(
-        session_id=session_id,
-        question_id=question_id,
-        asr_text=asr_text or "",
-        confidence=None,
-    )
+    asr_text = asr_text or ""
 
+    # persist + cache + log
+    t["answer_text"] = asr_text
+    result = {
+        "session_id": session_id,
+        "question_id": question_id,
+        "asr_text": asr_text,
+        "confidence": None,
+    }
+    _IDEMP[idem] = (_now_ms(), result)
 
+    short_hash = hashlib.sha1(data).hexdigest()[:10]
+    log.info("[ASR] sid=%s qid=%s bytes=%d hash=%s text_len=%d text=%r",
+             session_id, question_id, len(data), short_hash, len(asr_text), asr_text[:140])
+
+    return JSONResponse(result)
 
 @router.post("/score", response_model=SimScoreRes)
 async def sim_score(req: SimScoreReq):
-    """
-    Scores the last answer for the given question:
-    - Content (via Ollama judge, async)
-    - Pronunciation (via IPA mapping, if expected_text provided)
-    - Fluency (simple heuristic)
-    """
     turns = _TURNS.get(req.session_id)
     if not turns:
         raise HTTPException(status_code=404, detail="session not found")
@@ -143,7 +178,6 @@ async def sim_score(req: SimScoreReq):
     try:
         judge_json = await _judge.judge_content(_CONTENT_RUBRIC, evidence)
     except Exception as e:
-        # fail-soft so the rest of scoring continues
         judge_json = {"score": 0, "tips": [f"(ollama error: {type(e).__name__})"]}
 
     try:
@@ -153,14 +187,12 @@ async def sim_score(req: SimScoreReq):
 
     # 2) PRONUNCIATION
     if req.expected_text:
-        # Reading-mode strict scoring
         try:
             pron_json = score_pronunciation(req.expected_text, ans or "")
             pronunciation = int(pron_json["overall"].get("score_0_100", 0))
         except Exception:
             pronunciation = 0
     else:
-        # Open-answer fallback until you score audio directly
         pronunciation = 80 if ans else 0
 
     # 3) FLUENCY (cheap heuristic for now)
@@ -169,7 +201,6 @@ async def sim_score(req: SimScoreReq):
 
     overall = round(0.55 * content + 0.30 * pronunciation + 0.15 * fluency)
 
-    # persist scores in turn
     t["content_score"] = content
     t["pron_score"] = pronunciation
     t["fluency_score"] = fluency
@@ -190,7 +221,6 @@ async def sim_score(req: SimScoreReq):
         ),
         tips=tips,
     )
-
 
 @router.get("/report", response_model=SimReportRes)
 def sim_report(session_id: str):
@@ -230,7 +260,6 @@ async def sim_answer_llm(session_id: str, question_id: str):
 
     user_text = (t.get("answer_text") or "").strip()
     if not user_text:
-        # If no ASR yet, rephrase the question so the conversation continues
         user_text = f"(No answer captured yet.) The question was: {t.get('q','')}"
 
     reply = await _judge.a_tutor_reply(
@@ -238,10 +267,8 @@ async def sim_answer_llm(session_id: str, question_id: str):
         role=role,
         level=level,
         mode=mode,
-        # model=None -> use OLLAMA_MODEL env (e.g. llama3.1)
         max_tokens=256,
         temperature=0.6,
     )
-    t["tutor_reply"] = reply  # optional persistence for UI
-
+    t["tutor_reply"] = reply
     return {"reply": reply}
