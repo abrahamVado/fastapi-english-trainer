@@ -26,21 +26,85 @@ def _normalize_for_compare(s: str) -> str:
     s = re.sub(r"[.?!]+$", "", s)
     return s
 
-def _dedupe_sentences(text: str) -> str:
-    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
-    out, last_norm = [], ""
-    for p in parts:
-        p_norm = _normalize_for_compare(p)
-        if p_norm and (p_norm == last_norm or
-                       (last_norm and SequenceMatcher(None, p_norm, last_norm).ratio() >= 0.92)):
-            continue
-        if p.strip():
-            out.append(p.strip())
-            last_norm = p_norm
-    s = " ".join(out)
-    s = re.sub(r"\b(\w+)(\s+\1){2,}\b", r"\1", s, flags=re.IGNORECASE)
+# --- Stronger repetition cleaner for ASR text --------------------------------
+import difflib
+
+_CLAUSE_SPLIT = re.compile(r"[\.!\?,;:\n]\s*")
+
+def _norm_clause(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9'\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def _similar(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    # quick substring heuristic
+    if a in b or b in a:
+        la, lb = len(a), len(b)
+        return min(la, lb) / max(la, lb)
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+def _clean_transcript(text: str) -> str:
+    """
+    Split by clauses, drop near-duplicate restarts and short garbled tails,
+    collapse token loops, and tidy punctuation.
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    raw = [c.strip() for c in _CLAUSE_SPLIT.split(s) if c and c.strip()]
+    kept, kept_norm = [], []
+
+    for c in raw:
+        # collapse short loops inside a clause
+        c2 = re.sub(r"\b((\w+\s+){1,3}\w+)\b(?:\s+\1\b){1,}", r"\1", c, flags=re.IGNORECASE)
+        c2 = re.sub(r"(\b[\w\'\-]{3,}\b)(?:\s+\1){1,}", r"\1", c2, flags=re.IGNORECASE)
+        cn = _norm_clause(c2)
+        if not cn:
+            continue
+
+        words = cn.split()
+        is_short = len(words) <= 4
+        drop = False
+
+        for i, prev in enumerate(kept_norm):
+            sim = _similar(cn, prev)
+            # short fragments that largely overlap an earlier clause → drop
+            if is_short and sim >= 0.75:
+                drop = True
+                break
+            # near-duplicate clause → keep only the longer/clearer one
+            if sim >= 0.88:
+                if len(c2) <= len(kept[i]):
+                    drop = True
+                else:
+                    kept[i] = c2
+                    kept_norm[i] = cn
+                break
+
+        if not drop:
+            kept.append(c2)
+            kept_norm.append(cn)
+
+    # Normalize repeated "hello" leads
+    for i in range(len(kept)):
+        kept[i] = re.sub(r"^(hello[\s,;:!-]+){1,}", "Hello, ", kept[i], flags=re.IGNORECASE).strip()
+
+    # Remove consecutive exact dupes after normalization
+    out = []
+    for c in kept:
+        if out and _norm_clause(c) == _norm_clause(out[-1]):
+            continue
+        out.append(c)
+
+    final = ". ".join(out).strip()
+    final = re.sub(r"\s+([?!.,;:])", r"\1", final)
+    if final and final[-1] not in ".!?":
+        final += "."
+    return final
 
 # Try to import the high-quality decoder
 try:
@@ -173,11 +237,12 @@ class WhisperService:
             vad_parameters={"min_silence_duration_ms": 250, "speech_pad_ms": 150},
             beam_size=max(1, self.beam_size),
             best_of=max(1, self.best_of),
-            temperature=[float(self.temperature)],     # no temp sweep
+            temperature=[0.0, 0.2, 0.4],
             initial_prompt=(initial_prompt[:1800] if initial_prompt else None),
             word_timestamps=False,
-            condition_on_previous_text=False,          # <- critical
+            condition_on_previous_text=True,          # <- critical
             no_repeat_ngram_size=4,                    # <- blocks short repeats
+            repetition_penalty=1.1,
             compression_ratio_threshold=2.4,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
@@ -215,8 +280,8 @@ class WhisperService:
             else:
                 raise
 
-        text = " ".join(s.text.strip() for s in segments if getattr(s, "text", None)).strip()
-        text = _dedupe_sentences(text)
+        raw_text = " ".join(s.text.strip() for s in segments if getattr(s, "text", None)).strip()
+        text = _clean_transcript(raw_text)
 
         # Light normalization: capitalize first letter if sentence looks lowercased
         if text and text[0].islower():

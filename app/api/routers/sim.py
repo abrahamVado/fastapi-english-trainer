@@ -1,8 +1,8 @@
 # app/api/routers/sim.py
 from __future__ import annotations
 
-import uuid, hashlib, time, logging
-from typing import Dict, List, Optional
+import uuid, hashlib, time, logging, re
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Header
 from fastapi.responses import JSONResponse
@@ -29,22 +29,136 @@ _judge = OllamaJudge()  # async/sync capable per the improved client
 _SESS: Dict[str, Dict] = {}         # session_id -> {"role":..,"level":..,"mode":..}
 _TURNS: Dict[str, List[Dict]] = {}  # session_id -> [{qid, q, answer_text, ...}, ...]
 
-# --- Simple idempotency cache (swap for Redis in prod) ----------------------
-_IDEMP: Dict[str, tuple[int, dict]] = {}  # key -> (ts_ms, result_json)
+# --- Idempotency & duplicate detection (server-side "eco" killers) ----------
+# 1) Response cache by client request id (works even if audio changes)
+_REQ_CACHE: Dict[str, Tuple[int, dict]] = {}   # X-Req-Id -> (ts_ms, result_json)
+_REQ_TTL_MS = 5 * 60 * 1000
+
+# 2) Existing blob-idempotency cache (your original) keyed by (client_key + blob hash)
+_IDEMP: Dict[str, Tuple[int, dict]] = {}       # key -> (ts_ms, result_json)
 _IDEMP_TTL_MS = 5 * 60 * 1000
+
+# 3) Duplicate audio fingerprint per (session_id, question_id)
+_AUDIO_FP: Dict[str, Tuple[int, str]] = {}     # "sid:qid" -> (ts_ms, sha1_hex)
+_AUDIO_TTL_MS = 15 * 60 * 1000
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
-def _clean_idemp():
+def _gc_maps():
     now = _now_ms()
+    # clean request-id cache
+    for k in list(_REQ_CACHE.keys()):
+        if now - _REQ_CACHE[k][0] > _REQ_TTL_MS:
+            _REQ_CACHE.pop(k, None)
+    # clean idempotency cache
     for k in list(_IDEMP.keys()):
         if now - _IDEMP[k][0] > _IDEMP_TTL_MS:
             _IDEMP.pop(k, None)
+    # clean audio fingerprints
+    for k in list(_AUDIO_FP.keys()):
+        if now - _AUDIO_FP[k][0] > _AUDIO_TTL_MS:
+            _AUDIO_FP.pop(k, None)
 
 def _idem_key(client_key: Optional[str], audio_bytes: bytes) -> str:
     h = hashlib.sha1(audio_bytes).hexdigest()
     return f"{client_key or 'noid'}:{h}"
+
+def _audio_key(session_id: str, question_id: str) -> str:
+    return f"{session_id}:{question_id}"
+
+def _fingerprint(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+# --- Strong repetition cleaner for ASR text ----------------------------------
+import difflib
+
+_CLAUSE_SPLIT = re.compile(r"[\.!\?,;:\n]\s*")
+
+def _norm_clause(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9'\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # common “are you” → “nargus” style confusions still compare well after norm,
+    # but we also defang hello-loops by trimming repeated hello tokens later.
+    return s
+
+def _similar(a: str, b: str) -> float:
+    # Fast path for substrings
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        # Treat substring as highly similar
+        la, lb = len(a), len(b)
+        return min(la, lb) / max(la, lb)
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+def _dedupe_text(asr_text: str) -> str:
+    s = (asr_text or "").strip()
+    if not s:
+        return s
+
+    raw_clauses = [c.strip() for c in _CLAUSE_SPLIT.split(s) if c and c.strip()]
+    if not raw_clauses:
+        return s
+
+    kept: list[str] = []
+    kept_norm: list[str] = []
+
+    for c in raw_clauses:
+        # kill tiny token loops inside a clause (e.g., "really really")
+        c2 = re.sub(r"\b((\w+\s+){1,3}\w+)\b(?:\s+\1\b){1,}", r"\1", c, flags=re.IGNORECASE)
+        c2 = re.sub(r"(\b[\w\'\-]{3,}\b)(?:\s+\1){1,}", r"\1", c2, flags=re.IGNORECASE)
+        cn = _norm_clause(c2)
+        if not cn:
+            continue
+
+        # drop very short fragments that look like restarts ("hello my friend", "are you")
+        words = cn.split()
+        is_short = len(words) <= 4
+
+        drop = False
+        for i, prev in enumerate(kept_norm):
+            sim = _similar(cn, prev)
+            # If it's a short fragment and largely overlaps an earlier clause, drop it
+            if is_short and sim >= 0.75:
+                drop = True
+                break
+            # If it's a near-duplicate even when not short, keep only the longer/clearer one
+            if sim >= 0.88:
+                # prefer the longer raw text
+                if len(c2) <= len(kept[i]):
+                    drop = True
+                else:
+                    kept[i] = c2
+                    kept_norm[i] = cn
+                break
+
+        if drop:
+            continue
+
+        kept.append(c2)
+        kept_norm.append(cn)
+
+    # collapse repetitive "hello" lead-ins across kept clauses
+    for i in range(len(kept)):
+        kept[i] = re.sub(r"^(hello[\s,;:!-]+){1,}", "Hello, ", kept[i], flags=re.IGNORECASE).strip()
+        # trim duplicated "hello" between clauses by normalizing again later
+
+    # Rejoin into a clean sentence or two; remove consecutive exact duplicates
+    out: list[str] = []
+    for c in kept:
+        if out and _norm_clause(c) == _norm_clause(out[-1]):
+            continue
+        out.append(c)
+
+    final = ". ".join(out).strip()
+    # tidy punctuation
+    final = re.sub(r"\s+([?!.,;:])", r"\1", final)
+    if not final.endswith((".", "!", "?")):
+        final += "."
+    return final
+
 
 # --- LLM rubric --------------------------------------------------------------
 _CONTENT_RUBRIC = """Grade content from 0-100:
@@ -99,8 +213,9 @@ async def sim_answer_audio(
     question_id: str = Form(...),
     audio: UploadFile = File(...),
     client_audio_id: Optional[str] = Form(None),
-    x_idempotency_key: Optional[str] = Header(None, convert_underscores=False),
+    x_req_id: Optional[str] = Header(None, convert_underscores=False),  # <— client sends the same id to TTS
 ):
+    # validate session/turn
     turns = _TURNS.get(session_id)
     if not turns:
         raise HTTPException(status_code=404, detail="session not found")
@@ -108,19 +223,53 @@ async def sim_answer_audio(
     if not t:
         raise HTTPException(status_code=404, detail="question not found")
 
+    _gc_maps()
+
+    # --- (A) Return cached result if same X-Req-Id (client retried) ----------
+    if x_req_id and x_req_id in _REQ_CACHE:
+        cached = _REQ_CACHE[x_req_id][1]
+        # keep turn state consistent
+        t["answer_text"] = cached.get("asr_text", "") or ""
+        return JSONResponse(cached)
+
+    # --- (B) Read audio & compute keys ---------------------------------------
     data = await audio.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty audio upload")
 
-    # ---- Idempotency: same blob shouldn't be transcribed twice --------------
-    _clean_idemp()
-    idem = _idem_key(x_idempotency_key or client_audio_id, data)
+    idem = _idem_key(x_req_id or client_audio_id, data)
+
+    # --- (C) If same blob already processed anywhere, return cached ----------
     if idem in _IDEMP:
         cached = _IDEMP[idem][1]
         t["answer_text"] = cached.get("asr_text", "") or ""
+        # also map X-Req-Id cache for this turn
+        if x_req_id:
+            _REQ_CACHE[x_req_id] = (_now_ms(), cached)
         return JSONResponse(cached)
 
-    # ---- Build a small domain hint for ASR ----------------------------------
+    # --- (D) If same bytes posted again for same (session,question), ignore ---
+    akey = _audio_key(session_id, question_id)
+    data_fp = _fingerprint(data)
+    prev = _AUDIO_FP.get(akey)
+    if prev and prev[1] == data_fp:
+        res = {
+            "session_id": session_id,
+            "question_id": question_id,
+            "asr_text": "",
+            "confidence": None,
+            "note": "duplicate audio ignored",
+        }
+        # cache under all maps so subsequent retries stay consistent
+        _IDEMP[idem] = (_now_ms(), res)
+        if x_req_id:
+            _REQ_CACHE[x_req_id] = (_now_ms(), res)
+        return JSONResponse(res)
+
+    # record latest fp for this (session, question)
+    _AUDIO_FP[akey] = (_now_ms(), data_fp)
+
+    # --- (E) Build domain hint for ASR ---------------------------------------
     sess = _SESS.get(session_id, {})
     initial_prompt = (
         f"Interview context. Role: {sess.get('role','')}. "
@@ -128,17 +277,16 @@ async def sim_answer_audio(
         "Common tech terms: Kubernetes, gRPC, PostgreSQL, TypeScript, React, Kafka, Terraform, AWS."
     )
 
-    # 👇 Pass actual MIME (e.g., 'audio/webm;codecs=opus'). WhisperService should
-    #     handle VAD + no cross-chunk conditioning internally.
+    # --- (F) Transcribe with your service; then lightly de-repeat ------------
     asr_text = await _asr.transcribe(
         data,
         language="en",
         initial_prompt=initial_prompt,
         content_type=(audio.content_type or "")
     )
-    asr_text = asr_text or ""
+    asr_text = _dedupe_text(asr_text or "")
 
-    # persist + cache + log
+    # --- (G) Persist + cache + log -------------------------------------------
     t["answer_text"] = asr_text
     result = {
         "session_id": session_id,
@@ -146,9 +294,12 @@ async def sim_answer_audio(
         "asr_text": asr_text,
         "confidence": None,
     }
-    _IDEMP[idem] = (_now_ms(), result)
+    now = _now_ms()
+    _IDEMP[idem] = (now, result)
+    if x_req_id:
+        _REQ_CACHE[x_req_id] = (now, result)
 
-    short_hash = hashlib.sha1(data).hexdigest()[:10]
+    short_hash = data_fp[:10]
     log.info("[ASR] sid=%s qid=%s bytes=%d hash=%s text_len=%d text=%r",
              session_id, question_id, len(data), short_hash, len(asr_text), asr_text[:140])
 

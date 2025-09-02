@@ -58,11 +58,23 @@ export default function App() {
   const addMessage = useCallback(
     (role, type, payload) => {
       setChats((prev) =>
-        prev.map((c) =>
-          c.id === currentChatId
-            ? { ...c, messages: [...c.messages, makeMsg(role, type, payload)] }
-            : c
-        )
+        prev.map((c) => {
+          if (c.id !== currentChatId) return c;
+          const last = c.messages[c.messages.length - 1];
+          const norm = (t, p) =>
+            t === "text"
+              ? String(p || "").trim().replace(/\s+/g, " ")
+              : p; // non-text (audio/blob) bypasses
+          if (
+            last &&
+            last.role === role &&
+            last.type === type &&
+            norm(type, last.payload) === norm(type, payload)
+          ) {
+            return c; // drop consecutive duplicate
+          }
+          return { ...c, messages: [...c.messages, makeMsg(role, type, payload)] };
+        })
       );
     },
     [currentChatId]
