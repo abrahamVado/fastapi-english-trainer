@@ -1,7 +1,5 @@
 # English Trainer API (FastAPI)
 
-# English Trainer API (FastAPI)
-
 This repository contains a **full-stack English training platform** built with **FastAPI** (backend) and **React/Vite** (frontend).  
 It provides GPU-accelerated **speech-to-text (STT)** via *faster-whisper*, high-quality **text-to-speech (TTS)** with *Bark*, and experimental modules for **IPA conversion**, **pronunciation scoring**, and **interview simulation**.  
 
