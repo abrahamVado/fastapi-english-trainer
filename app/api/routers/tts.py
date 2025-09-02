@@ -146,8 +146,8 @@ async def tts_say(req: SpeakRequest):
             level=req.level or "",
             mode=req.mode or "",
             model=req.llm_model,      # None → env default (OLLAMA_MODEL)
-            max_tokens=256,
-            temperature=0.6,
+            max_tokens=100,
+            temperature=0.3,
         )
         tts_text = (reply or "").strip()
         source = "LLM"

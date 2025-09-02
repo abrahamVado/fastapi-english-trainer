@@ -1,141 +1,151 @@
 # app/services/tts/bark_service.py
 from __future__ import annotations
-import io, re, wave, os, asyncio
-import numpy as np
-import inspect 
+import os
 
+# ---- HARD DISABLE CUDA FOR BARK/TORCH (must be set before torch/bark imports) ----
+# Hide all CUDA devices so Torch reports 0 GPUs (and Bark won't poke CUDA at import)
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Bark smaller models by default
+os.environ.setdefault("SUNO_USE_SMALL_MODELS", "1")
 
-# Bark 0.1.5 can expose APIs in slightly different places; make this robust.
+# Optional: reduce Torch CUDA allocator fragmentation if someone later enables CUDA
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+
+# ---- Import torch and monkey-patch cuda probes to be safe on systems with broken drivers ----
+import torch  # noqa: E402
+
+# Some Torch builds still think CUDA is "available" even with 0 visible devices.
+# Make sure any probe Bark does returns CPU-only semantics.
 try:
-    from bark import generate_audio, preload_models
-    from bark.generation import SAMPLE_RATE
+    import types  # noqa: E402
+    _cuda = torch.cuda
+
+    def _false(*args, **kwargs): return False
+    def _zero(*args, **kwargs): return 0
+
+    # Only patch if there are zero visible devices (or if you want to force CPU unconditionally)
+    if _cuda.device_count() == 0:
+        _cuda.is_available = _false          # type: ignore[attr-defined]
+        _cuda.is_initialized = _false        # type: ignore[attr-defined]
+        _cuda.device_count = _zero           # type: ignore[attr-defined]
+        # Newer torch adds this API; ensure it doesn't touch device 0
+        if hasattr(_cuda, "is_bf16_supported"):
+            _cuda.is_bf16_supported = _false   # type: ignore[attr-defined]
 except Exception:
-    from bark.api import generate_audio          # type: ignore
-    from bark.generation import SAMPLE_RATE, preload_models  # type: ignore
+    # If anything goes wrong here, we prefer failing "closed" (CPU only)
+    pass
 
-import torch
+# ---- Now it is safe to import Bark; it will see CPU only ----
+import io, re, wave, asyncio, inspect, logging, gc  # noqa: E402
+from typing import Optional  # noqa: E402
+import numpy as np  # noqa: E402
 
-# Prefer CUDA if present, but don’t crash if missing
-if torch.cuda.is_available():
-    try:
-        torch.set_default_device("cuda")
-        torch.backends.cudnn.benchmark = True
-    except Exception:
-        pass  # safe fallback
+try:
+    from bark import generate_audio, preload_models  # noqa: E402
+    from bark.generation import SAMPLE_RATE  # noqa: E402
+except Exception:
+    from bark.api import generate_audio          # type: ignore  # noqa: E402
+    from bark.generation import SAMPLE_RATE, preload_models  # type: ignore  # noqa: E402
+
+log = logging.getLogger("tts.bark")
+
 
 class BarkService:
     """
-    Bark TTS wrapper.
-    - Generates 24 kHz audio from text using a voice preset (history_prompt).
-    - By default returns a single WAV as bytes (fits <audio>).
-    - Concurrency is limited via a semaphore to protect GPU VRAM.
+    Bark TTS wrapper (CPU + small models).
     """
 
-    _is_warmed_full = False
     _is_warmed_small = False
-    _sem = asyncio.Semaphore(1)   # Bark is heavy; raise cautiously if VRAM allows.
+    _is_warmed_full = False
+    _sem = asyncio.Semaphore(1)
 
     def __init__(
         self,
         voice_preset: str = "v2/es_speaker_0",
         text_temp: float = 0.7,
         waveform_temp: float = 0.7,
-        use_small_default: bool = False,
+        use_small_default: bool = True,
     ):
         self.voice_preset = voice_preset
         self.text_temp = float(text_temp)
         self.waveform_temp = float(waveform_temp)
         self.use_small_default = bool(use_small_default)
 
-        # default to full models unless SMALL explicitly requested
-        os.environ.setdefault("SUNO_USE_SMALL_MODELS", "false")
-
     @classmethod
-    def warm_models(cls, *, use_small: bool = False):
-        """
-        Version-tolerant warmup:
-        - If this Bark build accepts per-stage small flags, pass only the ones it supports.
-        - If it only accepts `use_small`, pass that.
-        - If it accepts no kwargs, call with no args.
-        - Also toggles SUNO_USE_SMALL_MODELS for older releases.
-        """
-        # avoid duplicate warmups
-        if use_small and cls._is_warmed_small:
-            return
-        if (not use_small) and cls._is_warmed_full:
-            return
-
-        # some Bark builds respect this env var only
-        os.environ["SUNO_USE_SMALL_MODELS"] = "true" if use_small else "false"
-
-        # figure out what preload_models actually accepts
+    def _supported_kwargs(cls):
         try:
-            sig = inspect.signature(preload_models)
-            supported = set(sig.parameters.keys())
+            import inspect as _inspect
+            sig = _inspect.signature(preload_models)
+            return set(sig.parameters.keys())
         except Exception:
-            supported = set()
+            return set()
 
-        # candidate kwargs across versions
-        desired_kwargs = {
-            "use_small": use_small,                 # some versions
-            "text_use_small": use_small,            # others
+    def _preload(self, *, use_small: bool):
+        supported = self._supported_kwargs()
+        desired = {
+            "use_small": use_small,
+            "text_use_small": use_small,
             "coarse_use_small": use_small,
             "fine_use_small": use_small,
-            "codec_use_small": use_small,           # may be missing (causing your error)
+            "codec_use_small": use_small,
+            # Some Bark builds accept device=; on CPU-only this is harmless to omit
+            # "device": "cpu",
         }
-
-        # keep only supported kwargs
-        filtered = {k: v for k, v in desired_kwargs.items() if k in supported}
-
-        # try the most specific first, then fall back
+        kwargs = {k: v for k, v in desired.items() if k in supported}
+        log.warning("[Bark] preload_models small=%s kwargs=%s", use_small, list(kwargs.keys()))
         try:
-            if filtered:
-                preload_models(**filtered)
+            if kwargs:
+                preload_models(**kwargs)
             else:
                 preload_models()
         except TypeError:
-            # signature mismatch → final fallback
             preload_models()
 
+    def warm_models(self, *, use_small: bool = True):
+        if use_small and self._is_warmed_small:
+            return
+        if (not use_small) and self._is_warmed_full:
+            return
+        # Ensure env for older releases
+        os.environ["SUNO_USE_SMALL_MODELS"] = "1" if use_small else "0"
+        self._preload(use_small=use_small)
         if use_small:
-            cls._is_warmed_small = True
+            self._is_warmed_small = True
         else:
-            cls._is_warmed_full = True
-
+            self._is_warmed_full = True
 
     @staticmethod
     def _to_wav_bytes(samples: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
-        # Bark returns float32 [-1, 1]. Convert to 16-bit PCM WAV.
-        s = np.clip(samples, -1.0, 1.0)
+        s = np.clip(samples.astype(np.float32, copy=False), -1.0, 1.0)
         pcm = (s * 32767.0).astype(np.int16)
-
         bio = io.BytesIO()
         with wave.open(bio, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)      # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(sr)
             wf.writeframes(pcm.tobytes())
+        bio.seek(0)
         return bio.getvalue()
 
     @staticmethod
     def _split_into_chunks(text: str) -> list[str]:
-        # Lightweight sentence-ish splitter to keep latency reasonable.
-        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"\s+", " ", text or "").strip()
         if not text:
             return []
         parts = re.split(r"(?<=[\.\?\!;])\s+|,\s{1,3}", text)
-
         chunks, buf = [], ""
         for p in parts:
             nxt = (buf + " " + p).strip() if buf else p
-            if len(nxt) < 100:  # keep chunks under ~100 chars
+            if len(nxt) <= 120:
                 buf = nxt
             else:
-                if buf: chunks.append(buf)
+                if buf:
+                    chunks.append(buf)
                 buf = p
         if buf:
             chunks.append(buf)
-        return chunks
+        return chunks[:12]
 
     async def synthesize_bytes(
         self,
@@ -147,11 +157,16 @@ class BarkService:
         text_temp: float | None = None,
         waveform_temp: float | None = None,
     ) -> bytes:
-        """
-        Generate a single WAV (bytes). Safe to return via Response/StreamingResponse.
-        """
-        use_small = self.use_small_default if use_small is None else use_small
-        self.warm_models(use_small=use_small)
+        small = self.use_small_default if use_small is None else bool(use_small)
+        # Warm models
+        try:
+            self.warm_models(use_small=small)
+        except Exception as e:
+            log.error("[Bark] warm_models failed (CPU-only): %s", e, exc_info=True)
+            # reset state just in case; then try again once
+            self._is_warmed_small = self._is_warmed_full = False
+            gc.collect()
+            self.warm_models(use_small=small)
 
         preset = (voice or self.voice_preset) or "v2/es_speaker_0"
         tt = self.text_temp if text_temp is None else float(text_temp)
@@ -159,24 +174,38 @@ class BarkService:
 
         chunks = self._split_into_chunks(text) or [""]
 
-        # Serialize heavy GPU work
         async with self._sem:
-            audio_all = None
-            for ch in chunks:
-                audio = generate_audio(
-                    ch,
-                    history_prompt=preset,
-                    text_temp=tt,
-                    waveform_temp=wt
-                )
-                audio_all = audio if audio_all is None else np.concatenate([audio_all, audio])
+            def _run_once():
+                audio_all = None
+                for ch in chunks:
+                    audio = generate_audio(
+                        ch,
+                        history_prompt=preset,
+                        text_temp=tt,
+                        waveform_temp=wt,
+                    )
+                    audio_all = audio if audio_all is None else np.concatenate([audio_all, audio])
+                return audio_all if audio_all is not None else np.zeros(1, dtype=np.float32)
 
-        return self._to_wav_bytes(audio_all if audio_all is not None else np.zeros(1, dtype=np.float32))
+            loop = asyncio.get_running_loop()
+            samples = await loop.run_in_executor(None, _run_once)
+
+        return self._to_wav_bytes(samples)
 
     async def synthesize_stream(self, *args, **kwargs):
-        """
-        Async generator that yields a *single* WAV blob.
-        (Keeping generator signature so you can later emit per-sentence chunks if you switch to MP3/WebM streaming.)
-        """
         wav = await self.synthesize_bytes(*args, **kwargs)
         yield wav
+
+
+# Singleton accessor
+_service: Optional[BarkService] = None
+def get_bark_service() -> BarkService:
+    global _service
+    if _service is None:
+        _service = BarkService(use_small_default=True)
+    return _service
+
+def reset_bark_service():
+    global _service
+    _service = BarkService(use_small_default=True)
+    gc.collect()

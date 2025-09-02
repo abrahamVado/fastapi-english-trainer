@@ -1,11 +1,6 @@
 // src/hooks/useRecorder.js
 import { useCallback, useEffect, useRef, useState } from "react";
 
-/**
- * Candidate MIME types to try in order of preference.
- * Most modern desktop browsers support "audio/webm;codecs=opus".
- * Safari may not support webm; if none of these are supported, we let MediaRecorder pick.
- */
 const MIME_CANDIDATES = [
   "audio/webm;codecs=opus",
   "audio/webm",
@@ -13,39 +8,18 @@ const MIME_CANDIDATES = [
   "audio/ogg",
 ];
 
-/** Pick the first MediaRecorder mimeType the browser claims to support. */
 function pickSupportedMime() {
   for (const m of MIME_CANDIDATES) {
-    if (window.MediaRecorder?.isTypeSupported?.(m)) return m;
+    try { if (window.MediaRecorder?.isTypeSupported?.(m)) return m; } catch {}
   }
   return "";
 }
 
-/** True if this origin can use getUserMedia (HTTPS or http://localhost). */
 function hasSecureMicSupport() {
   if (window.isSecureContext) return true;
-  // allow localhost (browsers treat it as a secure context)
   return /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
 }
 
-/**
- * useRecorder — ergonomic mic recorder hook using MediaRecorder.
- *
- * Features:
- *  - Secure-context & capability checks with friendly errors (works over HTTPS or localhost).
- *  - Optional hotkeys: Space (hold-to-record), Esc (cancel).
- *  - onBlob can be async; hook shows isProcessing during your upload/transcribe.
- *  - Permission state reflection (unknown/granted/denied).
- *  - Optional advanced constraints/deviceId.
- *
- * @param {Object} opts
- * @param {number}  [opts.maxSeconds=60]          Auto-stop after this many seconds (set null/0 to disable).
- * @param {function} opts.onBlob                  Callback(blob). Can return a Promise.
- * @param {boolean} [opts.enableHotkeys=true]     Space/Esc bindings.
- * @param {boolean} [opts.autoStopOnBlur=true]    Stop recording if page becomes hidden.
- * @param {MediaTrackConstraints} [opts.audioConstraints] Extra getUserMedia audio constraints.
- * @param {string} [opts.deviceId]                Specific microphone device id to use.
- */
 export function useRecorder({
   maxSeconds = 60,
   onBlob,
@@ -54,22 +28,24 @@ export function useRecorder({
   audioConstraints,
   deviceId,
 } = {}) {
-  // --- Public state ---------------------------------------------------------
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState(null);
-  const [mimeType, setMimeType] = useState("");            // chosen mimeType
-  const [durationSec, setDurationSec] = useState(0);       // last recording duration (approx)
-  const [permission, setPermission] = useState("unknown"); // "unknown" | "granted" | "denied"
+  const [mimeType, setMimeType] = useState("");
+  const [durationSec, setDurationSec] = useState(0);
+  const [permission, setPermission] = useState("unknown");
 
-  // --- Internals ------------------------------------------------------------
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const timerRef = useRef(null);
   const startedAtRef = useRef(0);
 
-  /** Best-effort polyfill to reflect current microphone permission (if supported). */
+  // NEW: guard against rapid double-starts before state updates land
+  const startLockRef = useRef(false);
+  // NEW: per-recording session id to ignore stale events
+  const sessionIdRef = useRef(0);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -77,29 +53,23 @@ export function useRecorder({
         if (navigator.permissions?.query) {
           const st = await navigator.permissions.query({ name: "microphone" });
           if (!cancelled) {
-            setPermission(st.state); // "granted" | "prompt" | "denied" (map "prompt" to "unknown")
-            st.onchange = () => setPermission(st.state);
+            setPermission(st.state === "prompt" ? "unknown" : st.state);
+            st.onchange = () => setPermission(st.state === "prompt" ? "unknown" : st.state);
           }
         }
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
-  /** Teardown helper: stops recorder + mic tracks, clears timer. */
-  const teardown = useCallback(() => {
-    try {
-      mediaRecorderRef.current?.stop?.();
-    } catch {}
-    mediaRecorderRef.current = null;
+  // Choose a MIME once
+  useEffect(() => {
+    setMimeType(pickSupportedMime() || "(browser default)");
+  }, []);
 
-    try {
-      streamRef.current?.getTracks?.().forEach((t) => t.stop());
-    } catch {}
+  // Stop tracks & timers; DO NOT call mr.stop() here (can re-enter onstop)
+  const teardown = useCallback(() => {
+    try { streamRef.current?.getTracks?.().forEach((t) => t.stop()); } catch {}
     streamRef.current = null;
 
     if (timerRef.current) {
@@ -108,44 +78,34 @@ export function useRecorder({
     }
   }, []);
 
-  /**
-   * Start recording:
-   *  - Checks secure context & feature availability (clear message if LAN over http).
-   *  - Requests mic with optional constraints/deviceId.
-   *  - Picks best mimeType and wires MediaRecorder.
-   *  - Auto-stops at maxSeconds if configured.
-   */
   const start = useCallback(async () => {
-    if (isRecording || isProcessing) return;
+    if (isRecording || isProcessing || startLockRef.current) return;
+    startLockRef.current = true;
     setError(null);
 
-    // 1) Security/capability guards up-front
     if (!hasSecureMicSupport()) {
-      const msg =
-        "Mic requires HTTPS or http://localhost. Open the app at https://<your-ip>:5173 or use localhost.";
+      const msg = "Mic requires HTTPS or http://localhost.";
       setError(msg);
+      startLockRef.current = false;
       throw new Error(msg);
     }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      // Try to gently polyfill from legacy APIs (very old browsers)
-      const legacyGetUserMedia =
-        navigator.getUserMedia ||
-        navigator.webkitGetUserMedia ||
-        navigator.mozGetUserMedia;
-      if (legacyGetUserMedia) {
+
+    // Polyfill getUserMedia if needed (legacy)
+    if (!navigator.mediaDevices?.getUserMedia) {
+      const legacy = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+      if (legacy) {
         navigator.mediaDevices = navigator.mediaDevices || {};
         navigator.mediaDevices.getUserMedia = (c) =>
-          new Promise((res, rej) => legacyGetUserMedia.call(navigator, c, res, rej));
+          new Promise((res, rej) => legacy.call(navigator, c, res, rej));
       } else {
-        const msg =
-          "getUserMedia is not available in this context. Use a modern browser over HTTPS or localhost.";
+        const msg = "getUserMedia not available. Use a modern browser over HTTPS or localhost.";
         setError(msg);
+        startLockRef.current = false;
         throw new Error(msg);
       }
     }
 
     try {
-      // 2) Build constraints
       const constraints = {
         audio: {
           echoCancellation: true,
@@ -156,63 +116,58 @@ export function useRecorder({
         },
       };
 
-      // 3) Ask for permission (prompts once)
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       setPermission("granted");
       streamRef.current = stream;
 
-      // 4) Choose MIME
       const chosen = pickSupportedMime();
-      setMimeType(chosen || "(browser default)");
-
-      // 5) Create recorder
       const mr = new MediaRecorder(stream, chosen ? { mimeType: chosen } : undefined);
+
       chunksRef.current = [];
+      const mySession = ++sessionIdRef.current; // NEW session id
 
       mr.ondataavailable = (e) => {
+        if (sessionIdRef.current !== mySession) return; // ignore stale
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
 
-      // When recording stops → build blob, hand off to onBlob (await it if async)
       mr.onstop = async () => {
-        const elapsed = Math.max(
-          0,
-          Math.round((performance.now() - startedAtRef.current) / 1000)
-        );
+        if (sessionIdRef.current !== mySession) return; // ignore stale
+        const elapsed = Math.max(0, Math.round((performance.now() - startedAtRef.current) / 1000));
         setDurationSec(elapsed);
 
-        const blob = new Blob(chunksRef.current, {
-          type: mr.mimeType || "audio/webm",
-        });
+        const blob = new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" });
         chunksRef.current = [];
 
-        if (blob.size && typeof onBlob === "function") {
-          try {
-            setIsProcessing(true);
-            await onBlob(blob); // support async
-          } catch (err) {
-            console.error("onBlob error:", err);
-            setError(err?.message || String(err));
-          } finally {
-            setIsProcessing(false);
-          }
-        } else {
-          setIsProcessing(false);
-        }
+        // Clear recorder ref BEFORE teardown to prevent re-entry
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
 
-        teardown();
+        try {
+          if (blob.size && typeof onBlob === "function") {
+            setIsProcessing(true);
+            await onBlob(blob);
+          }
+        } catch (err) {
+          console.error("onBlob error:", err);
+          setError(err?.message || String(err));
+        } finally {
+          setIsProcessing(false);
+          teardown();
+        }
       };
 
-      // 6) Kick off recording
       mediaRecorderRef.current = mr;
-      mr.start();
+      mr.start();                 // one-shot; no timeslice → single final blob
       startedAtRef.current = performance.now();
       setIsRecording(true);
 
-      // 7) Optional safety: auto-stop after maxSeconds
       if (maxSeconds && maxSeconds > 0) {
         timerRef.current = setTimeout(() => {
-          stop(); // graceful stop
+          // guard double stops
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+            try { mediaRecorderRef.current.stop(); } catch {}
+          }
         }, maxSeconds * 1000);
       }
     } catch (err) {
@@ -222,38 +177,35 @@ export function useRecorder({
       setIsRecording(false);
       setIsProcessing(false);
       teardown();
-      throw err; // surface to caller if needed
+      startLockRef.current = false;
+      throw err;
+    } finally {
+      // Release the start lock a tick later to avoid back-to-back clicks
+      setTimeout(() => { startLockRef.current = false; }, 0);
     }
   }, [isRecording, isProcessing, maxSeconds, onBlob, audioConstraints, deviceId, teardown]);
 
-  /** Stop recording and finalize the blob (invokes onBlob). */
   const stop = useCallback(() => {
     const mr = mediaRecorderRef.current;
     if (!mr || mr.state !== "recording") return;
-    try {
-      mr.stop(); // triggers onstop handler above
-    } catch {}
-    setIsRecording(false);
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    try { mr.stop(); } catch {}
+    // isRecording will be set false in onstop after the blob is built
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
   }, []);
 
-  /** Cancel recording: discard chunks and stop without emitting a blob. */
   const cancel = useCallback(() => {
     const mr = mediaRecorderRef.current;
-    if (!mr) return;
     chunksRef.current = [];
-    try {
-      if (mr.state === "recording") mr.stop();
-    } catch {}
+    if (mr && mr.state === "recording") {
+      try { mr.stop(); } catch {}
+    }
+    mediaRecorderRef.current = null;
     setIsRecording(false);
     setIsProcessing(false);
     teardown();
   }, [teardown]);
 
-  // Optional: hotkeys — Space = press & hold to record, Esc = cancel
+  // Hotkeys: Space (hold-to-record), Esc (cancel)
   useEffect(() => {
     if (!enableHotkeys) return;
 
@@ -281,34 +233,31 @@ export function useRecorder({
     };
   }, [enableHotkeys, isRecording, isProcessing, start, stop, cancel]);
 
-  // Optional: auto-stop if the tab becomes hidden (prevents background recording issues)
+  // Auto-stop on tab hide
   useEffect(() => {
     if (!autoStopOnBlur) return;
     const onVis = () => {
-      if (document.hidden && isRecording) stop();
+      if (document.hidden && mediaRecorderRef.current?.state === "recording") {
+        try { mediaRecorderRef.current.stop(); } catch {}
+      }
     };
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
-  }, [autoStopOnBlur, isRecording, stop]);
+  }, [autoStopOnBlur]);
 
-  // Cleanup on unmount (stop tracks/clear timers)
+  // Cleanup on unmount
   useEffect(() => teardown, [teardown]);
 
   return {
-    // states
     isRecording,
     isProcessing,
     error,
     mimeType,
     durationSec,
-    permission, // "unknown" | "granted" | "denied"
-
-    // controls
+    permission,
     start,
     stop,
     cancel,
-
-    // advanced: let callers force/reflect UI state if they need
     setIsProcessing,
   };
 }
