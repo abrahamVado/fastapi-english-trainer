@@ -16,6 +16,8 @@ from fastapi.responses import Response
 
 from app.services.tts.bark_service import get_bark_service
 from app.services.judge.ollama_client import OllamaJudge
+from typing import Literal  # make sure this is present
+
 
 log = logging.getLogger("tts")
 
@@ -26,7 +28,25 @@ router = APIRouter(prefix="/tts", tags=["tts"])
 _judge = OllamaJudge()
 
 VOICE_PATH = Path(__file__).resolve().parents[2] / "app" / "voices" / "es_0.npz"
+# Curated built-in Bark voice IDs
+BUILTIN_VOICES = {
+    "en": [f"v2/en_speaker_{i}" for i in range(10)],
+    "es": [f"v2/es_speaker_{i}" for i in range(5)],
+    "fr": [f"v2/fr_speaker_{i}" for i in range(4)],
+    "de": [f"v2/de_speaker_{i}" for i in range(4)],
+    "hi": [f"v2/hi_speaker_{i}" for i in range(2)],
+    "zh": ["v2/zh_speaker_0"],
+    "ja": ["v2/ja_speaker_0"],
+}
 
+def _list_local_npz() -> list[str]:
+    try:
+        if not VOICE_DIR.exists():
+            return []
+        return sorted(str(p) for p in VOICE_DIR.glob("*.npz"))
+    except Exception:
+        log.exception("[TTS] listing local voices failed")
+        return []
 # -------------------- Length helpers --------------------
 def _word_budget(req) -> tuple[int, str, int]:
     """
@@ -325,3 +345,42 @@ async def tts_warm():
         return {"ok": True, "warmed": True}
     except Exception as e:
         return {"ok": False, "error": type(e).__name__}
+
+@router.get("/voices", summary="List available voices (built-ins + local .npz)")
+def tts_voices():
+    return {
+        "builtin": BUILTIN_VOICES,
+        "local": _list_local_npz(),
+        "default": "v2/es_speaker_0",
+    }
+
+
+class PreviewRequest(BaseModel):
+    voice: Optional[str] = Field(None, description="Voice id or .npz path")
+    text: Optional[str] = Field(None, description="Preview text")
+    speed: Optional[float] = Field(None, gt=0.25, lt=4.0)
+
+
+@router.post("/preview", summary="Render a short sample for a given voice")
+async def tts_preview(req: PreviewRequest):
+    preview_text = (req.text or "Hola, esta es una muestra de voz breve.").strip()
+    svc = get_bark_service()
+    voice_arg = req.voice or ("v2/es_speaker_0")
+
+    try:
+        wav_bytes = await svc.synthesize_bytes(preview_text, voice=voice_arg, seed=12345)
+        return Response(
+            wav_bytes, media_type="audio/wav",
+            headers={
+                "Cache-Control": "no-store",
+                "X-TTS-Voice": voice_arg,
+                "Content-Length": str(len(wav_bytes)),
+            },
+        )
+    except Exception as e:
+        log.exception("[TTS] preview failed: %s", e)
+        from app.api.routers.tts import gen_beep_wav_bytes
+        return Response(
+            gen_beep_wav_bytes(), media_type="audio/wav", status_code=500,
+            headers={"Cache-Control": "no-store", "X-TTS-Error": type(e).__name__},
+        )

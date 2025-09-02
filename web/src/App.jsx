@@ -137,6 +137,7 @@ export default function App() {
               role: ROLE,
               level: LEVEL,
               mode: MODE,
+              voice: "v2/en_speaker_7"
             }),
           });
           if (!ttsRes.ok) throw new Error(`tts/say -> ${ttsRes.status}`);
